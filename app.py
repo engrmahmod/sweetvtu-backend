@@ -680,7 +680,7 @@ def fund_sync():
     user = get_user(g.user_id)
     if not user.get('monnify_acct'):
         return jsonify({'ok': False, 'error': 'No funding account yet.'}), 400
-    acct_ref = f'sweetvtu-{g.user_id}'
+    acct_ref = user.get('monnify_ref') or f'sweetvtu-{g.user_id}'
     try:
         tok = monnify_token()
         r = requests.get(
