@@ -669,7 +669,17 @@ def monnify_webhook():
     if not ev or not sig or not MONNIFY_SECRET_KEY:
         return jsonify({'ok': False}), 400
     if not _monnify_sig_ok(ev, sig, MONNIFY_SECRET_KEY.strip()):
-        return jsonify({'ok': False}), 401
+        # TEMP DEBUG (remove after webhook verified): echo what Monnify sent so the
+        # signature inputs can be compared in the Monnify event log. No secrets here.
+        return jsonify({'ok': False, 'dbg': {
+            'paymentReference': ev.get('paymentReference'),
+            'amountPaid': ev.get('amountPaid'),
+            'amountPaidType': type(ev.get('amountPaid')).__name__,
+            'paidOn': ev.get('paidOn'),
+            'transactionReference': ev.get('transactionReference'),
+            'eventType': d.get('eventType'),
+            'evKeys': sorted(ev.keys()),
+        }}), 401
     if d.get('eventType') != 'SUCCESSFUL_TRANSACTION' or ev.get('paymentStatus') != 'PAID':
         return jsonify({'ok': True})
     prod = ev.get('product') or {}
