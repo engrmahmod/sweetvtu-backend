@@ -15,7 +15,7 @@ Env vars:
   SMTP_FROM_NAME        (sender name shown on emails, default SWEETVTU)
   PORT
 """
-import os, re, json, secrets, sqlite3, uuid, smtplib, hashlib
+import os, re, json, secrets, sqlite3, uuid, smtplib, hashlib, hmac, base64, time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from email.mime.text import MIMEText
@@ -120,7 +120,9 @@ def init_db():
     for s in stmts:
         run(s)
     # migrate older databases that lack the new columns
-    for col in ("email_verified INTEGER DEFAULT 0", "tx_pin_hash TEXT"):
+    for col in ("email_verified INTEGER DEFAULT 0", "tx_pin_hash TEXT",
+                "monnify_ref TEXT", "monnify_acct TEXT",
+                "monnify_bank TEXT", "monnify_acct_name TEXT"):
         try:
             run(f"ALTER TABLE users ADD COLUMN {col}")
         except Exception:
@@ -160,7 +162,7 @@ def admin_auth(f):
     return wrapper
 
 def get_user(uid):
-    rows = q("SELECT id,name,phone,email,wallet,email_verified,created FROM users WHERE id=?", (uid,))
+    rows = q("SELECT id,name,phone,email,wallet,email_verified,created,monnify_ref,monnify_acct,monnify_bank,monnify_acct_name FROM users WHERE id=?", (uid,))
     return rows[0] if rows else None
 
 # ---------------- email verification ----------------
@@ -330,7 +332,9 @@ def config():
     return jsonify({'ok': True, 'paystack_public_key': PAYSTACK_PUBLIC,
                     'sandbox': SANDBOX, 'live': True,
                     'email_via': 'brevo' if BREVO_API_KEY else 'smtp',
-                    'email_ready': bool(BREVO_API_KEY or (SMTP_USER and SMTP_APP_PASSWORD))})
+                    'email_ready': bool(BREVO_API_KEY or (SMTP_USER and SMTP_APP_PASSWORD)),
+                    'monnify_ready': monnify_configured(),
+                    'fund_method': 'monnify'})
 
 @app.post('/api/signup')
 def signup():
@@ -495,6 +499,130 @@ def fund_verify():
         return jsonify({'ok': True, 'user': get_user(g.user_id)})
     run("UPDATE transactions SET status='failed' WHERE reference=?", (ref,))
     return jsonify({'ok': False, 'error': 'Payment was not successful.'}), 400
+
+# ---------------- wallet funding (Monnify reserved virtual accounts) ----------------
+MONNIFY_API_KEY    = os.environ.get('MONNIFY_API_KEY', '').strip()
+MONNIFY_SECRET_KEY = os.environ.get('MONNIFY_SECRET_KEY', '').strip()
+MONNIFY_CONTRACT   = os.environ.get('MONNIFY_CONTRACT_CODE', '').strip()
+MONNIFY_SANDBOX    = os.environ.get('MONNIFY_SANDBOX', '1') == '1'
+MONNIFY_BVN        = os.environ.get('MONNIFY_BVN', '').strip()
+MONNIFY_BASE       = 'https://sandbox.monnify.com' if MONNIFY_SANDBOX else 'https://api.monnify.com'
+_monnify = {'token': None, 'exp': 0}
+
+def monnify_configured():
+    return bool(MONNIFY_API_KEY and MONNIFY_SECRET_KEY and MONNIFY_CONTRACT)
+
+def monnify_token():
+    """OAuth token for Monnify, cached until near expiry."""
+    if _monnify['token'] and _monnify['exp'] > time.time() + 60:
+        return _monnify['token']
+    creds = base64.b64encode(f'{MONNIFY_API_KEY}:{MONNIFY_SECRET_KEY}'.encode()).decode()
+    r = requests.post(f'{MONNIFY_BASE}/api/v1/auth/login',
+                      headers={'Authorization': f'Basic {creds}'}, timeout=20).json()
+    body = r.get('responseBody') or {}
+    tok = body.get('accessToken')
+    if not tok:
+        raise RuntimeError('Monnify auth failed: ' + str(r.get('responseMessage') or r))
+    _monnify['token'] = tok
+    try:
+        _monnify['exp'] = time.time() + int(body.get('expiresIn', 3600))
+    except Exception:
+        _monnify['exp'] = time.time() + 3500
+    return tok
+
+@app.get('/api/monnify-status')
+@auth
+def monnify_status():
+    return jsonify({'ok': True, 'configured': monnify_configured(),
+                    'sandbox': MONNIFY_SANDBOX})
+
+@app.post('/api/fund-account')
+@auth
+def fund_account():
+    """Return the user's personal Monnify virtual account, creating it on first use."""
+    if not monnify_configured():
+        return jsonify({'ok': False, 'error': 'Bank funding is not set up yet. Try again later.'}), 503
+    user = get_user(g.user_id)
+    if user.get('monnify_acct'):
+        return jsonify({'ok': True, 'account_number': user['monnify_acct'],
+                        'bank_name': user['monnify_bank'],
+                        'account_name': user['monnify_acct_name']})
+    d = request.get_json(force=True, silent=True) or {}
+    bvn = (d.get('bvn') or '').strip() or MONNIFY_BVN or ('22222222222' if MONNIFY_SANDBOX else '')
+    if not bvn:
+        return jsonify({'ok': False, 'need_bvn': True,
+                        'error': 'Your BVN is required to create your personal funding account.'}), 400
+    ref = f'sweetvtu-{g.user_id}'
+    try:
+        tok = monnify_token()
+        r = requests.post(
+            f'{MONNIFY_BASE}/api/v2/bank-transfer/reserved-accounts',
+            headers={'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'},
+            json={'accountReference': ref,
+                  'accountName': (user.get('name') or 'SWEETVTU Customer')[:40],
+                  'currencyCode': 'NGN',
+                  'contractCode': MONNIFY_CONTRACT,
+                  'customerEmail': user.get('email'),
+                  'customerName': user.get('name'),
+                  'bvn': bvn,
+                  'getAllAvailableBanks': True},
+            timeout=30).json()
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Could not reach Monnify. Try again.'}), 502
+    body = r.get('responseBody') or {}
+    accts = body.get('accounts') or []
+    if not r.get('requestSuccessful') or not accts:
+        msg = str(r.get('responseMessage') or 'Monnify error')
+        if 'bvn' in msg.lower():
+            return jsonify({'ok': False, 'need_bvn': True,
+                            'error': 'A valid BVN is required: ' + msg}), 400
+        return jsonify({'ok': False, 'error': 'Monnify error: ' + msg}), 502
+    a = accts[0]
+    run("""UPDATE users SET monnify_ref=?, monnify_acct=?, monnify_bank=?, monnify_acct_name=?
+           WHERE id=?""",
+        (body.get('reservationReference') or ref, a.get('accountNumber'),
+         a.get('bankName'), a.get('accountName'), g.user_id))
+    return jsonify({'ok': True, 'account_number': a.get('accountNumber'),
+                    'bank_name': a.get('bankName'), 'account_name': a.get('accountName')})
+
+@app.post('/api/monnify-webhook')
+def monnify_webhook():
+    """Monnify payment notification. Verifies SHA-512 signature, credits wallet once."""
+    d = request.get_json(force=True, silent=True) or {}
+    ev = d.get('eventData') or {}
+    sig = request.headers.get('monnify-signature') or d.get('transactionHash') or ''
+    if not ev or not sig or not MONNIFY_SECRET_KEY:
+        return jsonify({'ok': False}), 400
+    src = '|'.join([MONNIFY_SECRET_KEY, str(ev.get('paymentReference')),
+                    str(ev.get('amountPaid')), str(ev.get('paidOn')),
+                    str(ev.get('transactionReference'))])
+    calc = hashlib.sha512(src.encode('utf-8')).hexdigest()
+    if not hmac.compare_digest(calc.lower(), sig.lower()):
+        return jsonify({'ok': False}), 401
+    if d.get('eventType') != 'SUCCESSFUL_TRANSACTION' or ev.get('paymentStatus') != 'PAID':
+        return jsonify({'ok': True})
+    prod = ev.get('product') or {}
+    m = re.match(r'sweetvtu-(\d+)$', str(prod.get('reference') or ''))
+    if not m:
+        return jsonify({'ok': True})
+    uid = int(m.group(1))
+    tx_ref = str(ev.get('transactionReference') or '')
+    try:
+        amount = float(ev.get('amountPaid') or 0)
+    except Exception:
+        amount = 0
+    if amount <= 0 or not tx_ref:
+        return jsonify({'ok': True})
+    # idempotent: transactionReference is UNIQUE; duplicates are ignored
+    try:
+        run("""INSERT INTO transactions(user_id,type,service,description,amount,direction,
+               status,reference,provider_ref,created)
+               VALUES(?, 'fund','monnify',?,?,'in','successful',?,?,?)""",
+            (uid, 'Wallet funding via bank transfer', amount, tx_ref, tx_ref, now_iso()))
+    except Exception:
+        return jsonify({'ok': True, 'duplicate': True})
+    run("UPDATE users SET wallet=wallet+? WHERE id=?", (amount, uid))
+    return jsonify({'ok': True})
 
 # ---------------- VTpass services ----------------
 NETWORKS = {'mtn': 'mtn', 'glo': 'glo', 'airtel': 'airtel', 'etisalat': 'etisalat'}
