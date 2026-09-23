@@ -172,7 +172,8 @@ def send_email(to_email, subject, body):
         msg['To'] = to_email
         with smtplib.SMTP('smtp.gmail.com', 587, timeout=20) as s:
             s.starttls()
-            s.login(SMTP_USER, SMTP_APP_PASSWORD)
+            # Gmail shows app passwords with spaces; strip them
+            s.login(SMTP_USER, SMTP_APP_PASSWORD.replace(' ', ''))
             s.send_message(msg)
         return True
     except Exception:
@@ -309,7 +310,8 @@ def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload):
 @app.get('/api/config')
 def config():
     return jsonify({'ok': True, 'paystack_public_key': PAYSTACK_PUBLIC,
-                    'sandbox': SANDBOX, 'live': True})
+                    'sandbox': SANDBOX, 'live': True,
+                    'smtp_ready': bool(SMTP_USER and SMTP_APP_PASSWORD)})
 
 @app.post('/api/signup')
 def signup():
