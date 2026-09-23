@@ -576,6 +576,26 @@ def fund_account():
         if 'bvn' in msg.lower():
             return jsonify({'ok': False, 'need_bvn': True,
                             'error': 'A valid BVN is required: ' + msg}), 400
+        if 'same reference' in msg.lower():
+            # This reference was reserved before (e.g. the local DB was reset).
+            # Recover the existing reserved account instead of failing.
+            try:
+                g2 = requests.get(
+                    f'{MONNIFY_BASE}/api/v2/bank-transfer/reserved-accounts/{ref}',
+                    headers={'Authorization': f'Bearer {tok}'}, timeout=30).json()
+                body2 = g2.get('responseBody') or {}
+                accts2 = body2.get('accounts') or []
+                if g2.get('requestSuccessful') and accts2:
+                    a2 = accts2[0]
+                    run("""UPDATE users SET monnify_ref=?, monnify_acct=?, monnify_bank=?,
+                           monnify_acct_name=? WHERE id=?""",
+                        (body2.get('reservationReference') or ref, a2.get('accountNumber'),
+                         a2.get('bankName'), a2.get('accountName'), g.user_id))
+                    return jsonify({'ok': True, 'account_number': a2.get('accountNumber'),
+                                    'bank_name': a2.get('bankName'),
+                                    'account_name': a2.get('accountName')})
+            except Exception:
+                pass
         return jsonify({'ok': False, 'error': 'Monnify error: ' + msg}), 502
     a = accts[0]
     run("""UPDATE users SET monnify_ref=?, monnify_acct=?, monnify_bank=?, monnify_acct_name=?
