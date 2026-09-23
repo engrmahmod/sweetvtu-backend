@@ -706,19 +706,7 @@ def monnify_webhook():
         return jsonify({'ok': False}), 400
     matched, tried = _monnify_sig_match(ev, sig, MONNIFY_SECRET_KEY, MONNIFY_API_KEY, raw)
     if not matched:
-        # TEMP DEBUG (remove after webhook verified): echo what Monnify sent so the
-        # signature inputs can be compared in the Monnify event log. No secrets here.
-        return jsonify({'ok': False, 'dbg': {
-            'paymentReference': ev.get('paymentReference'),
-            'amountPaid': ev.get('amountPaid'),
-            'amountPaidType': type(ev.get('amountPaid')).__name__,
-            'paidOn': ev.get('paidOn'),
-            'transactionReference': ev.get('transactionReference'),
-            'eventType': d.get('eventType'),
-            'evKeys': sorted(ev.keys()),
-            'tried': tried,
-            'sigHead': (sig or '').strip()[:12],
-        }}), 401
+        return jsonify({'ok': False}), 401
     if d.get('eventType') != 'SUCCESSFUL_TRANSACTION' or ev.get('paymentStatus') != 'PAID':
         return jsonify({'ok': True})
     prod = ev.get('product') or {}
@@ -735,7 +723,7 @@ def monnify_webhook():
         return jsonify({'ok': True})
     # idempotent + atomic: transactionReference is UNIQUE; duplicates are ignored
     if credit_wallet_atomic(uid, amount, tx_ref, 'Wallet funding via bank transfer'):
-        return jsonify({'ok': True, 'via': matched})  # TEMP DEBUG: show which sig method matched
+        return jsonify({'ok': True})
     return jsonify({'ok': True, 'duplicate': True})
 
 @app.post('/api/fund-sync')
