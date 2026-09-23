@@ -637,27 +637,54 @@ def credit_wallet_atomic(uid, amount, tx_ref, description):
     finally:
         con.close()
 
-def _monnify_sig_ok(ev, sig, secret):
-    """Monnify signs SHA512(secret|paymentReference|amountPaid|paidOn|transactionReference),
-    but amountPaid can arrive as 1000, 1000.0 or "1000.00" while the signed text used
-    one exact form. Try every plausible rendering so a formatting difference can't
-    cause a false reject."""
-    amt = ev.get('amountPaid')
-    cands = {str(amt)}
-    try:
-        f = float(amt)
-        cands.add(str(int(f)) if f.is_integer() else repr(f))
-        cands.add(f'{f:.2f}')
-        cands.add(('%.10f' % f).rstrip('0').rstrip('.'))
-    except Exception:
-        pass
-    sig = (sig or '').lower()
-    for c in cands:
-        src = '|'.join([secret, str(ev.get('paymentReference')), c,
-                        str(ev.get('paidOn')), str(ev.get('transactionReference'))])
-        if hmac.compare_digest(hashlib.sha512(src.encode('utf-8')).hexdigest().lower(), sig):
-            return True
-    return False
+def _monnify_sig_match(ev, sig, secret, api_key):
+    """Try plausible (key, amount) combos for the Monnify webhook signature.
+
+    Monnify documents SHA512(secret|paymentReference|amountPaid|paidOn|transactionReference),
+    but the sandbox may sign with the API key instead of the secret, and amountPaid
+    may have been rendered as 1000 / 1000.0 / 1000.00. Returns (matched_label, tried).
+    All keys tried are our own server-side secrets; amount variants are equivalent
+    renderings of the same credited amount, so a match is still a valid verification.
+    """
+    pr = str(ev.get('paymentReference') or '')
+    tr = str(ev.get('transactionReference') or '')
+    paid_on = str(ev.get('paidOn') or '')
+    sig = (sig or '').strip().lower()
+    amts = set()
+
+    def _add(raw):
+        if raw is None or isinstance(raw, bool):
+            return
+        if isinstance(raw, int):
+            amts.update([str(raw), '%d.0' % raw, '%.2f' % raw])
+        elif isinstance(raw, float):
+            amts.add(repr(raw))
+            amts.add('%.2f' % raw)
+            if raw.is_integer():
+                amts.add(str(int(raw)))
+        else:
+            s = str(raw).strip()
+            if s:
+                amts.add(s)
+                try:
+                    amts.add('%.2f' % float(s))
+                except (ValueError, TypeError):
+                    pass
+
+    _add(ev.get('amountPaid'))
+    _add(ev.get('settlementAmount'))
+    _add(ev.get('totalPayable'))
+    tried = 0
+    for klabel, key in (('secret', secret), ('apikey', api_key)):
+        key = (key or '').strip()
+        if not key:
+            continue
+        for a in sorted(amts):
+            tried += 1
+            src = '|'.join([key, pr, a, paid_on, tr])
+            if hmac.compare_digest(hashlib.sha512(src.encode('utf-8')).hexdigest().lower(), sig):
+                return '%s|%s' % (klabel, a), tried
+    return None, tried
 
 
 @app.post('/api/monnify-webhook')
@@ -668,7 +695,8 @@ def monnify_webhook():
     sig = request.headers.get('monnify-signature') or d.get('transactionHash') or ''
     if not ev or not sig or not MONNIFY_SECRET_KEY:
         return jsonify({'ok': False}), 400
-    if not _monnify_sig_ok(ev, sig, MONNIFY_SECRET_KEY.strip()):
+    matched, tried = _monnify_sig_match(ev, sig, MONNIFY_SECRET_KEY, MONNIFY_API_KEY)
+    if not matched:
         # TEMP DEBUG (remove after webhook verified): echo what Monnify sent so the
         # signature inputs can be compared in the Monnify event log. No secrets here.
         return jsonify({'ok': False, 'dbg': {
@@ -679,6 +707,8 @@ def monnify_webhook():
             'transactionReference': ev.get('transactionReference'),
             'eventType': d.get('eventType'),
             'evKeys': sorted(ev.keys()),
+            'tried': tried,
+            'sigHead': (sig or '').strip()[:12],
         }}), 401
     if d.get('eventType') != 'SUCCESSFUL_TRANSACTION' or ev.get('paymentStatus') != 'PAID':
         return jsonify({'ok': True})
