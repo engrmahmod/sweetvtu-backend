@@ -585,6 +585,38 @@ def fund_account():
     return jsonify({'ok': True, 'account_number': a.get('accountNumber'),
                     'bank_name': a.get('bankName'), 'account_name': a.get('accountName')})
 
+def credit_wallet_atomic(uid, amount, tx_ref, description):
+    """Insert a funding transaction and credit the wallet in ONE database
+    transaction. Idempotent: transactionReference is UNIQUE, so a duplicate
+    returns False instead of crediting twice."""
+    ins = """INSERT INTO transactions(user_id,type,service,description,amount,direction,
+             status,reference,provider_ref,created)
+             VALUES(?, 'fund','monnify',?,?,'in','successful',?,?,?)"""
+    params = (uid, description, amount, tx_ref, tx_ref, now_iso())
+    if USE_PG:
+        cur = db().cursor()
+        try:
+            cur.execute(ins.replace('?', '%s'), params)
+            cur.execute("UPDATE users SET wallet=wallet+%s WHERE id=%s", (amount, uid))
+            db().commit()
+            return True
+        except Exception:
+            db().rollback()
+            return False
+        finally:
+            cur.close()
+    con = db()
+    try:
+        con.execute(ins, params)
+        con.execute("UPDATE users SET wallet=wallet+? WHERE id=?", (amount, uid))
+        con.commit()
+        return True
+    except Exception:
+        con.rollback()
+        return False
+    finally:
+        con.close()
+
 @app.post('/api/monnify-webhook')
 def monnify_webhook():
     """Monnify payment notification. Verifies SHA-512 signature, credits wallet once."""
@@ -613,16 +645,53 @@ def monnify_webhook():
         amount = 0
     if amount <= 0 or not tx_ref:
         return jsonify({'ok': True})
-    # idempotent: transactionReference is UNIQUE; duplicates are ignored
+    # idempotent + atomic: transactionReference is UNIQUE; duplicates are ignored
+    if credit_wallet_atomic(uid, amount, tx_ref, 'Wallet funding via bank transfer'):
+        return jsonify({'ok': True})
+    return jsonify({'ok': True, 'duplicate': True})
+
+@app.post('/api/fund-sync')
+@auth
+def fund_sync():
+    """Pull the user's Monnify reserved-account transactions (server-to-server)
+    and credit anything new. Works even when the Monnify webhook can't reach us."""
+    if not monnify_configured():
+        return jsonify({'ok': False, 'error': 'Bank funding is not set up yet. Try again later.'}), 503
+    user = get_user(g.user_id)
+    if not user.get('monnify_acct'):
+        return jsonify({'ok': False, 'error': 'No funding account yet.'}), 400
+    acct_ref = f'sweetvtu-{g.user_id}'
     try:
-        run("""INSERT INTO transactions(user_id,type,service,description,amount,direction,
-               status,reference,provider_ref,created)
-               VALUES(?, 'fund','monnify',?,?,'in','successful',?,?,?)""",
-            (uid, 'Wallet funding via bank transfer', amount, tx_ref, tx_ref, now_iso()))
+        tok = monnify_token()
+        r = requests.get(
+            f'{MONNIFY_BASE}/api/v1/bank-transfer/reserved-accounts/transactions',
+            headers={'Authorization': f'Bearer {tok}'},
+            params={'accountReference': acct_ref, 'page': 0, 'size': 20},
+            timeout=30).json()
     except Exception:
-        return jsonify({'ok': True, 'duplicate': True})
-    run("UPDATE users SET wallet=wallet+? WHERE id=?", (amount, uid))
-    return jsonify({'ok': True})
+        return jsonify({'ok': False, 'error': 'Could not reach Monnify. Try again.'}), 502
+    if not r.get('requestSuccessful'):
+        return jsonify({'ok': False,
+                        'error': 'Monnify error: ' + str(r.get('responseMessage') or 'try again')}), 502
+    items = (r.get('responseBody') or {}).get('content') or []
+    credited = 0.0
+    count = 0
+    for it in items:
+        if (it.get('paymentStatus') or '') != 'PAID':
+            continue
+        tx_ref = str(it.get('transactionReference') or '')
+        try:
+            amount = float(it.get('amount') or 0)
+        except Exception:
+            amount = 0
+        if not tx_ref or amount <= 0:
+            continue
+        if credit_wallet_atomic(g.user_id, amount, tx_ref, 'Wallet funding via bank transfer'):
+            credited += amount
+            count += 1
+    bal = get_user(g.user_id).get('wallet', 0)
+    return jsonify({'ok': True, 'credited': credited,
+                    'new_transactions': count, 'balance': bal})
 
 # ---------------- VTpass services ----------------
 NETWORKS = {'mtn': 'mtn', 'glo': 'glo', 'airtel': 'airtel', 'etisalat': 'etisalat'}
