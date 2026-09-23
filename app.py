@@ -792,8 +792,24 @@ def fund_sync():
             credited += amount
             count += 1
     bal = get_user(g.user_id).get('wallet', 0)
+    # If the Monnify pull found nothing new, the money may already have been
+    # credited by the webhook a moment ago. Report the most recent funding so
+    # the app can answer "already received" instead of "not found".
+    recent = None
+    if credited == 0:
+        rows = q("""SELECT amount, created FROM transactions
+                    WHERE user_id=? AND type='fund' AND status='successful'
+                    ORDER BY id DESC LIMIT 1""", (g.user_id,))
+        if rows:
+            try:
+                age = (datetime.now(LAGOS) - datetime.fromisoformat(rows[0]['created'])).total_seconds()
+            except Exception:
+                age = 10 ** 9
+            if age <= 1800:
+                recent = {'amount': rows[0]['amount'], 'created': rows[0]['created']}
     return jsonify({'ok': True, 'credited': credited,
-                    'new_transactions': count, 'balance': bal})
+                    'new_transactions': count, 'balance': bal,
+                    'recent_funding': recent})
 
 # ---------------- VTpass services ----------------
 NETWORKS = {'mtn': 'mtn', 'glo': 'glo', 'airtel': 'airtel', 'etisalat': 'etisalat'}
