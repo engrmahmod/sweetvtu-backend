@@ -71,9 +71,17 @@ def q(sql, params=()):
     if USE_PG:
         sql = sql.replace('?', '%s')
         cur = db().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        cur.close()
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        except Exception:
+            try:
+                db().rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            cur.close()
         return [dict(r) for r in rows]
     cur = db().cursor()
     cur.execute(sql, params)
@@ -85,9 +93,20 @@ def run(sql, params=()):
     if USE_PG:
         sql = sql.replace('?', '%s')
         cur = db().cursor()
-        cur.execute(sql, params)
-        db().commit()
-        cur.close()
+        try:
+            cur.execute(sql, params)
+            db().commit()
+        except Exception:
+            # On Postgres a failed statement aborts the whole transaction;
+            # roll back so the connection stays usable for the next statement.
+            try:
+                db().rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            cur.close()
+        return
     else:
         con = db()
         con.execute(sql, params)
@@ -127,6 +146,12 @@ def init_db():
             run(f"ALTER TABLE users ADD COLUMN {col}")
         except Exception:
             pass
+    # Each Monnify account reference must belong to exactly one user.
+    # (NULLs are allowed multiple times on both SQLite and Postgres.)
+    try:
+        run("CREATE UNIQUE INDEX IF NOT EXISTS users_monnify_ref_uniq ON users(monnify_ref)")
+    except Exception:
+        pass
     if not q("SELECT v FROM settings WHERE k='margin'"):
         run("INSERT INTO settings(k,v) VALUES('margin','0')")
 
@@ -552,7 +577,12 @@ def fund_account():
     if not bvn:
         return jsonify({'ok': False, 'need_bvn': True,
                         'error': 'Your BVN is required to create your personal funding account.'}), 400
-    ref = f'sweetvtu-{g.user_id}'
+    # Reference must be globally unique and NEVER reused across users, even if
+    # the local database is wiped. A random UUID reference cannot collide the
+    # way the old 'sweetvtu-{user_id}' scheme did.
+    ref = (user.get('monnify_ref') or '').strip()
+    if not ref:
+        ref = 'sweetvtu-' + uuid.uuid4().hex[:20]
     try:
         tok = monnify_token()
         r = requests.post(
@@ -577,25 +607,28 @@ def fund_account():
             return jsonify({'ok': False, 'need_bvn': True,
                             'error': 'A valid BVN is required: ' + msg}), 400
         if 'same reference' in msg.lower():
-            # This reference was reserved before (e.g. the local DB was reset).
-            # Recover the existing reserved account instead of failing.
+            # This reference was reserved before (shouldn't happen with UUID
+            # references, but kept as a safety net). Recover the reservation
+            # only if Monnify returns the exact reference we asked for.
             try:
                 g2 = requests.get(
                     f'{MONNIFY_BASE}/api/v2/bank-transfer/reserved-accounts/{ref}',
                     headers={'Authorization': f'Bearer {tok}'}, timeout=30).json()
                 body2 = g2.get('responseBody') or {}
                 accts2 = body2.get('accounts') or []
-                if g2.get('requestSuccessful') and accts2:
+                got_ref = (body2.get('accountReference') or '').strip()
+                if g2.get('requestSuccessful') and accts2 and got_ref == ref:
                     a2 = accts2[0]
                     run("""UPDATE users SET monnify_ref=?, monnify_acct=?, monnify_bank=?,
                            monnify_acct_name=? WHERE id=?""",
-                        (body2.get('accountReference') or ref, a2.get('accountNumber'),
+                        (got_ref, a2.get('accountNumber'),
                          a2.get('bankName'), a2.get('accountName'), g.user_id))
                     return jsonify({'ok': True, 'account_number': a2.get('accountNumber'),
                                     'bank_name': a2.get('bankName'),
                                     'account_name': a2.get('accountName')})
             except Exception:
                 pass
+            return jsonify({'ok': False, 'error': 'Monnify error: account reference conflict. Try again.'}), 502
         return jsonify({'ok': False, 'error': 'Monnify error: ' + msg}), 502
     a = accts[0]
     run("""UPDATE users SET monnify_ref=?, monnify_acct=?, monnify_bank=?, monnify_acct_name=?
@@ -607,8 +640,12 @@ def fund_account():
 
 def credit_wallet_atomic(uid, amount, tx_ref, description):
     """Insert a funding transaction and credit the wallet in ONE database
-    transaction. Idempotent: transactionReference is UNIQUE, so a duplicate
-    returns False instead of crediting twice."""
+    transaction.
+
+    Returns 'ok' (credited), 'duplicate' (transactionReference already seen -
+    not an error), or 'error' (anything else - the credit did NOT happen).
+    Callers must not treat 'error' as 'already credited'.
+    """
     ins = """INSERT INTO transactions(user_id,type,service,description,amount,direction,
              status,reference,provider_ref,created)
              VALUES(?, 'fund','monnify',?,?,'in','successful',?,?,?)"""
@@ -618,102 +655,84 @@ def credit_wallet_atomic(uid, amount, tx_ref, description):
         try:
             cur.execute(ins.replace('?', '%s'), params)
             cur.execute("UPDATE users SET wallet=wallet+%s WHERE id=%s", (amount, uid))
+            if cur.rowcount != 1:
+                db().rollback()
+                return 'error'
             db().commit()
-            return True
-        except Exception:
+            return 'ok'
+        except Exception as e:
             db().rollback()
-            return False
+            # 23505 = unique_violation -> the transaction was already credited
+            if getattr(e, 'pgcode', '') == '23505':
+                return 'duplicate'
+            return 'error'
         finally:
             cur.close()
     con = db()
     try:
         con.execute(ins, params)
-        con.execute("UPDATE users SET wallet=wallet+? WHERE id=?", (amount, uid))
+        cur2 = con.execute("UPDATE users SET wallet=wallet+? WHERE id=?", (amount, uid))
+        if cur2.rowcount != 1:
+            con.rollback()
+            return 'error'
         con.commit()
-        return True
+        return 'ok'
+    except sqlite3.IntegrityError:
+        con.rollback()
+        return 'duplicate'
     except Exception:
         con.rollback()
-        return False
+        return 'error'
     finally:
         con.close()
 
-def _monnify_sig_match(ev, sig, secret, api_key, raw_body):
+def _monnify_sig_ok(sig, secret, raw_body):
     """Verify the Monnify webhook signature.
 
-    Per Monnify's own sample code, monnify-signature is HMAC-SHA512 of the RAW
-    request body, keyed with the merchant secret key. (Older guides describe a
-    plain SHA512 of pipe-joined fields; try that as a fallback.)
-    Returns (matched_label, tried).
+    STRICT: only the official signature is accepted - HMAC-SHA512 of the RAW
+    request body, keyed with the merchant secret key (per Monnify's own sample
+    code). No legacy/alternative formulas are accepted.
     """
     sig = (sig or '').strip().lower()
-    tried = 0
-    for klabel, key in (('hmac-secret', secret), ('hmac-apikey', api_key)):
-        key = (key or '').strip()
-        if not key or not raw_body:
-            continue
-        tried += 1
-        h = hmac.new(key.encode('utf-8'), raw_body, hashlib.sha512).hexdigest().lower()
-        if hmac.compare_digest(h, sig):
-            return 'hmac-' + klabel, tried
-    # Fallback: legacy documented formula
-    pr = str(ev.get('paymentReference') or '')
-    tr = str(ev.get('transactionReference') or '')
-    paid_on = str(ev.get('paidOn') or '')
-    amts = set()
-
-    def _add(raw):
-        if raw is None or isinstance(raw, bool):
-            return
-        if isinstance(raw, int):
-            amts.update([str(raw), '%d.0' % raw, '%.2f' % raw])
-        elif isinstance(raw, float):
-            amts.add(repr(raw))
-            amts.add('%.2f' % raw)
-            if raw.is_integer():
-                amts.add(str(int(raw)))
-        else:
-            s = str(raw).strip()
-            if s:
-                amts.add(s)
-                try:
-                    amts.add('%.2f' % float(s))
-                except (ValueError, TypeError):
-                    pass
-
-    _add(ev.get('amountPaid'))
-    _add(ev.get('settlementAmount'))
-    _add(ev.get('totalPayable'))
-    for klabel, key in (('pipe-secret', secret), ('pipe-apikey', api_key)):
-        key = (key or '').strip()
-        if not key:
-            continue
-        for a in sorted(amts):
-            tried += 1
-            src = '|'.join([key, pr, a, paid_on, tr])
-            if hmac.compare_digest(hashlib.sha512(src.encode('utf-8')).hexdigest().lower(), sig):
-                return 'pipe-%s|%s' % (klabel, a), tried
-    return None, tried
+    key = (secret or '').strip()
+    if not sig or not key or not raw_body:
+        return False
+    h = hmac.new(key.encode('utf-8'), raw_body, hashlib.sha512).hexdigest().lower()
+    return hmac.compare_digest(h, sig)
 
 
 @app.post('/api/monnify-webhook')
 def monnify_webhook():
-    """Monnify payment notification. Verifies HMAC-SHA512 signature, credits wallet once."""
+    """Monnify payment notification. Verifies HMAC-SHA512 signature, credits
+    wallet exactly once. The customer is resolved ONLY by exact match of the
+    stored monnify_ref - never by parsing a user ID out of the reference."""
     raw = request.get_data()  # raw bytes, exactly as Monnify sent them (for HMAC)
     d = request.get_json(force=True, silent=True) or {}
     ev = d.get('eventData') or {}
     sig = request.headers.get('monnify-signature') or d.get('transactionHash') or ''
     if not ev or not sig or not MONNIFY_SECRET_KEY:
         return jsonify({'ok': False}), 400
-    matched, tried = _monnify_sig_match(ev, sig, MONNIFY_SECRET_KEY, MONNIFY_API_KEY, raw)
-    if not matched:
+    if not _monnify_sig_ok(sig, MONNIFY_SECRET_KEY, raw):
         return jsonify({'ok': False}), 401
     if d.get('eventType') != 'SUCCESSFUL_TRANSACTION' or ev.get('paymentStatus') != 'PAID':
         return jsonify({'ok': True})
     prod = ev.get('product') or {}
-    m = re.match(r'sweetvtu-(\d+)$', str(prod.get('reference') or ''))
-    if not m:
+    # Candidate account references from the payload; the customer is found by
+    # exact lookup of the stored monnify_ref, never by parsing a user ID.
+    candidates = [str(prod.get('reference') or '').strip(),
+                  str(ev.get('accountReference') or '').strip(),
+                  str(prod.get('accountReference') or '').strip()]
+    uid = None
+    for acct_ref in candidates:
+        if not acct_ref:
+            continue
+        rows = q("SELECT id FROM users WHERE monnify_ref=?", (acct_ref,))
+        if rows:
+            uid = rows[0]['id']
+            break
+    if not uid:
+        # Not one of our reserved accounts (or reservation unknown here).
         return jsonify({'ok': True})
-    uid = int(m.group(1))
     tx_ref = str(ev.get('transactionReference') or '')
     try:
         amount = float(ev.get('amountPaid') or 0)
@@ -722,9 +741,8 @@ def monnify_webhook():
     if amount <= 0 or not tx_ref:
         return jsonify({'ok': True})
     # idempotent + atomic: transactionReference is UNIQUE; duplicates are ignored
-    if credit_wallet_atomic(uid, amount, tx_ref, 'Wallet funding via bank transfer'):
-        return jsonify({'ok': True})
-    return jsonify({'ok': True, 'duplicate': True})
+    status = credit_wallet_atomic(uid, amount, tx_ref, 'Wallet funding via bank transfer')
+    return jsonify({'ok': True, 'status': status})
 
 @app.post('/api/fund-sync')
 @auth
@@ -736,24 +754,23 @@ def fund_sync():
     user = get_user(g.user_id)
     if not user.get('monnify_acct'):
         return jsonify({'ok': False, 'error': 'No funding account yet.'}), 400
-    # The deterministic reference is what we sent at creation; the stored ref
-    # is a backup. Try both so an old/stale stored value can't break sync.
-    refs = [f'sweetvtu-{g.user_id}']
-    if user.get('monnify_ref') and user['monnify_ref'] not in refs:
-        refs.append(user['monnify_ref'])
+    # Resolve by the exact stored reference. Never reconstruct or guess the
+    # reference from the user ID - that caused cross-customer attachment.
+    acct_ref = (user.get('monnify_ref') or '').strip()
+    if not acct_ref:
+        return jsonify({'ok': False, 'error': 'No funding account yet.'}), 400
     items = None
     last_err = 'Monnify error: try again'
     try:
         tok = monnify_token()
-        for acct_ref in refs:
-            r = requests.get(
-                f'{MONNIFY_BASE}/api/v1/bank-transfer/reserved-accounts/transactions',
-                headers={'Authorization': f'Bearer {tok}'},
-                params={'accountReference': acct_ref, 'page': 0, 'size': 20},
-                timeout=30).json()
-            if r.get('requestSuccessful'):
-                items = (r.get('responseBody') or {}).get('content') or []
-                break
+        r = requests.get(
+            f'{MONNIFY_BASE}/api/v1/bank-transfer/reserved-accounts/transactions',
+            headers={'Authorization': f'Bearer {tok}'},
+            params={'accountReference': acct_ref, 'page': 0, 'size': 20},
+            timeout=30).json()
+        if r.get('requestSuccessful'):
+            items = (r.get('responseBody') or {}).get('content') or []
+        else:
             last_err = 'Monnify error: ' + str(r.get('responseMessage') or 'try again')
     except Exception:
         return jsonify({'ok': False, 'error': 'Could not reach Monnify. Try again.'}), 502
@@ -771,7 +788,7 @@ def fund_sync():
             amount = 0
         if not tx_ref or amount <= 0:
             continue
-        if credit_wallet_atomic(g.user_id, amount, tx_ref, 'Wallet funding via bank transfer'):
+        if credit_wallet_atomic(g.user_id, amount, tx_ref, 'Wallet funding via bank transfer') == 'ok':
             credited += amount
             count += 1
     bal = get_user(g.user_id).get('wallet', 0)
