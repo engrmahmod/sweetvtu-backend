@@ -637,6 +637,29 @@ def credit_wallet_atomic(uid, amount, tx_ref, description):
     finally:
         con.close()
 
+def _monnify_sig_ok(ev, sig, secret):
+    """Monnify signs SHA512(secret|paymentReference|amountPaid|paidOn|transactionReference),
+    but amountPaid can arrive as 1000, 1000.0 or "1000.00" while the signed text used
+    one exact form. Try every plausible rendering so a formatting difference can't
+    cause a false reject."""
+    amt = ev.get('amountPaid')
+    cands = {str(amt)}
+    try:
+        f = float(amt)
+        cands.add(str(int(f)) if f.is_integer() else repr(f))
+        cands.add(f'{f:.2f}')
+        cands.add(('%.10f' % f).rstrip('0').rstrip('.'))
+    except Exception:
+        pass
+    sig = (sig or '').lower()
+    for c in cands:
+        src = '|'.join([secret, str(ev.get('paymentReference')), c,
+                        str(ev.get('paidOn')), str(ev.get('transactionReference'))])
+        if hmac.compare_digest(hashlib.sha512(src.encode('utf-8')).hexdigest().lower(), sig):
+            return True
+    return False
+
+
 @app.post('/api/monnify-webhook')
 def monnify_webhook():
     """Monnify payment notification. Verifies SHA-512 signature, credits wallet once."""
@@ -645,11 +668,7 @@ def monnify_webhook():
     sig = request.headers.get('monnify-signature') or d.get('transactionHash') or ''
     if not ev or not sig or not MONNIFY_SECRET_KEY:
         return jsonify({'ok': False}), 400
-    src = '|'.join([MONNIFY_SECRET_KEY, str(ev.get('paymentReference')),
-                    str(ev.get('amountPaid')), str(ev.get('paidOn')),
-                    str(ev.get('transactionReference'))])
-    calc = hashlib.sha512(src.encode('utf-8')).hexdigest()
-    if not hmac.compare_digest(calc.lower(), sig.lower()):
+    if not _monnify_sig_ok(ev, sig, MONNIFY_SECRET_KEY.strip()):
         return jsonify({'ok': False}), 401
     if d.get('eventType') != 'SUCCESSFUL_TRANSACTION' or ev.get('paymentStatus') != 'PAID':
         return jsonify({'ok': True})
