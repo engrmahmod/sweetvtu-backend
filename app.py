@@ -10,11 +10,15 @@ Env vars:
   ADMIN_KEY             (protects /api/admin/*)
   DATABASE_URL          (optional postgres://... ; defaults to local sqlite)
   FRONTEND_ORIGIN       (comma-separated allowed origins, default *)
+  SMTP_USER             (Gmail address used to send verification codes, e.g. sweetvtu@gmail.com)
+  SMTP_APP_PASSWORD     (Gmail *app password*, not the login password)
+  SMTP_FROM_NAME        (sender name shown on emails, default SWEETVTU)
   PORT
 """
-import os, re, json, secrets, sqlite3, uuid
+import os, re, json, secrets, sqlite3, uuid, smtplib, hashlib
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from email.mime.text import MIMEText
 
 import requests
 from flask import Flask, request, jsonify, g
@@ -32,6 +36,9 @@ PAYSTACK_PUBLIC = os.environ.get('PAYSTACK_PUBLIC_KEY', '')
 ADMIN_KEY       = os.environ.get('ADMIN_KEY', '')
 DATABASE_URL    = os.environ.get('DATABASE_URL', '')
 FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', '*')
+SMTP_USER         = os.environ.get('SMTP_USER', '')
+SMTP_APP_PASSWORD = os.environ.get('SMTP_APP_PASSWORD', '')
+SMTP_FROM_NAME    = os.environ.get('SMTP_FROM_NAME', 'SWEETVTU')
 
 LAGOS = timezone(timedelta(hours=1))
 
@@ -89,9 +96,14 @@ def init_db():
     stmts = [
         f"""CREATE TABLE IF NOT EXISTS users(
              id {auto}, name TEXT, phone TEXT UNIQUE,
-             email TEXT, pass_hash TEXT, wallet REAL DEFAULT 0, created TEXT)""",
+             email TEXT, pass_hash TEXT, tx_pin_hash TEXT,
+             email_verified INTEGER DEFAULT 0,
+             wallet REAL DEFAULT 0, created TEXT)""",
         """CREATE TABLE IF NOT EXISTS tokens(
              token TEXT PRIMARY KEY, user_id INTEGER, created TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS email_codes(
+             id {auto}, user_id INTEGER,
+             code_hash TEXT, purpose TEXT, expires_at TEXT, created TEXT)""",
         f"""CREATE TABLE IF NOT EXISTS transactions(
              id {auto}, user_id INTEGER, type TEXT,
              service TEXT, description TEXT, amount REAL, direction TEXT,
@@ -104,6 +116,12 @@ def init_db():
     ]
     for s in stmts:
         run(s)
+    # migrate older databases that lack the new columns
+    for col in ("email_verified INTEGER DEFAULT 0", "tx_pin_hash TEXT"):
+        try:
+            run(f"ALTER TABLE users ADD COLUMN {col}")
+        except Exception:
+            pass
     if not q("SELECT v FROM settings WHERE k='margin'"):
         run("INSERT INTO settings(k,v) VALUES('margin','0')")
 
@@ -139,8 +157,58 @@ def admin_auth(f):
     return wrapper
 
 def get_user(uid):
-    rows = q("SELECT id,name,phone,email,wallet,created FROM users WHERE id=?", (uid,))
+    rows = q("SELECT id,name,phone,email,wallet,email_verified,created FROM users WHERE id=?", (uid,))
     return rows[0] if rows else None
+
+# ---------------- email verification ----------------
+def send_email(to_email, subject, body):
+    """Send an email via Gmail SMTP. Returns True on success."""
+    if not SMTP_USER or not SMTP_APP_PASSWORD:
+        return False
+    try:
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = f'{SMTP_FROM_NAME} <{SMTP_USER}>'
+        msg['To'] = to_email
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=20) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_APP_PASSWORD)
+            s.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+def new_email_code(user_id, purpose='verify'):
+    """Create a fresh 6-digit code (15-min expiry). Returns the plain code."""
+    code = str(secrets.randbelow(900000) + 100000)
+    chash = hashlib.sha256(code.encode()).hexdigest()
+    exp = (datetime.now(LAGOS) + timedelta(minutes=15)).isoformat(timespec='seconds')
+    run("DELETE FROM email_codes WHERE user_id=? AND purpose=?", (user_id, purpose))
+    run("""INSERT INTO email_codes(user_id,code_hash,purpose,expires_at,created)
+           VALUES(?,?,?,?,?)""", (user_id, chash, purpose, exp, now_iso()))
+    return code
+
+def send_verify_code(user):
+    code = new_email_code(user['id'], 'verify')
+    ok = send_email(
+        user['email'], 'Your SWEETVTU verification code',
+        f"Hello {user['name']},\n\nWelcome to SWEETVTU! Your email verification code is:\n\n"
+        f"{code}\n\nEnter this code in the app to activate your account. "
+        f"It expires in 15 minutes.\n\nIf you did not sign up, ignore this email.\n\n— SWEETVTU")
+    return ok
+
+def pin_required(f):
+    """Decorator: the request JSON must carry the correct 4-digit transaction PIN."""
+    @wraps(f)
+    def wrapper(*a, **kw):
+        d = request.get_json(force=True, silent=True) or {}
+        rows = q("SELECT tx_pin_hash FROM users WHERE id=?", (g.user_id,))
+        good = bool(rows and rows[0]['tx_pin_hash']) and \
+            check_password_hash(rows[0]['tx_pin_hash'], str(d.get('pin') or ''))
+        if not good:
+            return jsonify({'ok': False, 'error': 'Wrong transaction PIN.'}), 403
+        return f(*a, **kw)
+    return wrapper
 
 # ---------------- VTpass client ----------------
 def vt_get(path, params=None):
@@ -248,18 +316,78 @@ def signup():
     d = request.get_json(force=True)
     name, phone, email, pw = (d.get('name') or '').strip(), (d.get('phone') or '').strip(), \
                              (d.get('email') or '').strip(), d.get('password') or ''
+    pin = str(d.get('pin') or '').strip()
     if len(name) < 3: return jsonify({'ok': False, 'error': 'Please enter your full name.'}), 400
     if not re.match(r'^0\d{10}$', phone): return jsonify({'ok': False, 'error': 'Enter a valid 11-digit phone number.'}), 400
     if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email): return jsonify({'ok': False, 'error': 'Enter a valid email address.'}), 400
     if len(pw) < 4: return jsonify({'ok': False, 'error': 'Password must be at least 4 characters.'}), 400
+    if not re.match(r'^\d{4}$', pin):
+        return jsonify({'ok': False, 'error': 'Create a 4-digit transaction PIN.'}), 400
     if q("SELECT id FROM users WHERE phone=?", (phone,)):
         return jsonify({'ok': False, 'error': 'This number is already registered. Sign in instead.'}), 400
-    run("INSERT INTO users(name,phone,email,pass_hash,wallet,created) VALUES(?,?,?,?,0,?)",
-        (name, phone, email, generate_password_hash(pw), now_iso()))
+    run("""INSERT INTO users(name,phone,email,pass_hash,tx_pin_hash,email_verified,wallet,created)
+           VALUES(?,?,?,?,?,0,0,?)""",
+        (name, phone, email, generate_password_hash(pw), generate_password_hash(pin), now_iso()))
     uid = q("SELECT id FROM users WHERE phone=?", (phone,))[0]['id']
+    user = get_user(uid)
+    email_sent = send_verify_code(user)
+    # no token yet — account opens only after the email code is verified
+    return jsonify({'ok': True, 'verify_required': True, 'user_id': uid,
+                    'email': email, 'email_sent': email_sent})
+
+@app.post('/api/verify-email')
+def verify_email():
+    d = request.get_json(force=True)
+    try: uid = int(d.get('user_id') or 0)
+    except: uid = 0
+    code = str(d.get('code') or '').strip()
+    user = get_user(uid)
+    if not user:
+        return jsonify({'ok': False, 'error': 'Account not found. Sign up again.'}), 404
+    if user.get('email_verified'):
+        tok = secrets.token_hex(24)
+        run("INSERT INTO tokens(token,user_id,created) VALUES(?,?,?)", (tok, uid, now_iso()))
+        return jsonify({'ok': True, 'token': tok, 'user': user})
+    rows = q("SELECT * FROM email_codes WHERE user_id=? AND purpose='verify'", (uid,))
+    chash = hashlib.sha256(code.encode()).hexdigest()
+    if not rows or rows[0]['code_hash'] != chash:
+        return jsonify({'ok': False, 'error': 'Wrong code. Check the email and try again.'}), 400
+    if rows[0]['expires_at'] < now_iso():
+        return jsonify({'ok': False, 'error': 'Code expired. Tap resend for a new one.'}), 400
+    run("UPDATE users SET email_verified=1 WHERE id=?", (uid,))
+    run("DELETE FROM email_codes WHERE user_id=? AND purpose='verify'", (uid,))
     tok = secrets.token_hex(24)
     run("INSERT INTO tokens(token,user_id,created) VALUES(?,?,?)", (tok, uid, now_iso()))
     return jsonify({'ok': True, 'token': tok, 'user': get_user(uid)})
+
+@app.post('/api/resend-code')
+def resend_code():
+    d = request.get_json(force=True)
+    try: uid = int(d.get('user_id') or 0)
+    except: uid = 0
+    user = get_user(uid)
+    if not user:
+        return jsonify({'ok': False, 'error': 'Account not found. Sign up again.'}), 404
+    if user.get('email_verified'):
+        return jsonify({'ok': False, 'error': 'Email already verified. Sign in.'}), 400
+    email_sent = send_verify_code(user)
+    if not email_sent:
+        return jsonify({'ok': False, 'error': 'Could not send the email. Try again in a minute.'}), 502
+    return jsonify({'ok': True})
+
+@app.post('/api/change-pin')
+@auth
+def change_pin():
+    d = request.get_json(force=True)
+    old = str(d.get('old_pin') or '').strip()
+    new = str(d.get('new_pin') or '').strip()
+    rows = q("SELECT tx_pin_hash FROM users WHERE id=?", (g.user_id,))
+    if not rows or not rows[0]['tx_pin_hash'] or not check_password_hash(rows[0]['tx_pin_hash'], old):
+        return jsonify({'ok': False, 'error': 'Old PIN is wrong.'}), 403
+    if not re.match(r'^\d{4}$', new):
+        return jsonify({'ok': False, 'error': 'New PIN must be 4 digits.'}), 400
+    run("UPDATE users SET tx_pin_hash=? WHERE id=?", (generate_password_hash(new), g.user_id))
+    return jsonify({'ok': True})
 
 @app.post('/api/login')
 def login():
@@ -268,6 +396,9 @@ def login():
     rows = q("SELECT * FROM users WHERE phone=?", (phone,))
     if not rows or not check_password_hash(rows[0]['pass_hash'], pw):
         return jsonify({'ok': False, 'error': 'Wrong number or password. Try again.'}), 401
+    if not rows[0].get('email_verified'):
+        return jsonify({'ok': False, 'error': 'Please verify your email first — check your inbox for the code.',
+                        'verify_required': True, 'user_id': rows[0]['id']}), 403
     tok = secrets.token_hex(24)
     run("INSERT INTO tokens(token,user_id,created) VALUES(?,?,?)", (tok, rows[0]['id'], now_iso()))
     return jsonify({'ok': True, 'token': tok, 'user': get_user(rows[0]['id'])})
@@ -358,6 +489,7 @@ DISCOS = [
 
 @app.post('/api/buy/airtime')
 @auth
+@pin_required
 def buy_airtime():
     d = request.get_json(force=True)
     net = (d.get('network') or '').lower()
@@ -388,6 +520,7 @@ def data_plans():
 
 @app.post('/api/buy/data')
 @auth
+@pin_required
 def buy_data():
     d = request.get_json(force=True)
     net = (d.get('network') or 'mtn').lower()
@@ -442,6 +575,7 @@ def verify():
 
 @app.post('/api/buy/cable')
 @auth
+@pin_required
 def buy_cable():
     d = request.get_json(force=True)
     prov = (d.get('provider') or 'dstv').lower()
@@ -475,6 +609,7 @@ def discos():
 
 @app.post('/api/buy/power')
 @auth
+@pin_required
 def buy_power():
     d = request.get_json(force=True)
     svc = (d.get('serviceID') or '').strip()
