@@ -637,19 +637,28 @@ def credit_wallet_atomic(uid, amount, tx_ref, description):
     finally:
         con.close()
 
-def _monnify_sig_match(ev, sig, secret, api_key):
-    """Try plausible (key, amount) combos for the Monnify webhook signature.
+def _monnify_sig_match(ev, sig, secret, api_key, raw_body):
+    """Verify the Monnify webhook signature.
 
-    Monnify documents SHA512(secret|paymentReference|amountPaid|paidOn|transactionReference),
-    but the sandbox may sign with the API key instead of the secret, and amountPaid
-    may have been rendered as 1000 / 1000.0 / 1000.00. Returns (matched_label, tried).
-    All keys tried are our own server-side secrets; amount variants are equivalent
-    renderings of the same credited amount, so a match is still a valid verification.
+    Per Monnify's own sample code, monnify-signature is HMAC-SHA512 of the RAW
+    request body, keyed with the merchant secret key. (Older guides describe a
+    plain SHA512 of pipe-joined fields; try that as a fallback.)
+    Returns (matched_label, tried).
     """
+    sig = (sig or '').strip().lower()
+    tried = 0
+    for klabel, key in (('hmac-secret', secret), ('hmac-apikey', api_key)):
+        key = (key or '').strip()
+        if not key or not raw_body:
+            continue
+        tried += 1
+        h = hmac.new(key.encode('utf-8'), raw_body, hashlib.sha512).hexdigest().lower()
+        if hmac.compare_digest(h, sig):
+            return 'hmac-' + klabel, tried
+    # Fallback: legacy documented formula
     pr = str(ev.get('paymentReference') or '')
     tr = str(ev.get('transactionReference') or '')
     paid_on = str(ev.get('paidOn') or '')
-    sig = (sig or '').strip().lower()
     amts = set()
 
     def _add(raw):
@@ -674,8 +683,7 @@ def _monnify_sig_match(ev, sig, secret, api_key):
     _add(ev.get('amountPaid'))
     _add(ev.get('settlementAmount'))
     _add(ev.get('totalPayable'))
-    tried = 0
-    for klabel, key in (('secret', secret), ('apikey', api_key)):
+    for klabel, key in (('pipe-secret', secret), ('pipe-apikey', api_key)):
         key = (key or '').strip()
         if not key:
             continue
@@ -683,19 +691,20 @@ def _monnify_sig_match(ev, sig, secret, api_key):
             tried += 1
             src = '|'.join([key, pr, a, paid_on, tr])
             if hmac.compare_digest(hashlib.sha512(src.encode('utf-8')).hexdigest().lower(), sig):
-                return '%s|%s' % (klabel, a), tried
+                return 'pipe-%s|%s' % (klabel, a), tried
     return None, tried
 
 
 @app.post('/api/monnify-webhook')
 def monnify_webhook():
-    """Monnify payment notification. Verifies SHA-512 signature, credits wallet once."""
+    """Monnify payment notification. Verifies HMAC-SHA512 signature, credits wallet once."""
+    raw = request.get_data()  # raw bytes, exactly as Monnify sent them (for HMAC)
     d = request.get_json(force=True, silent=True) or {}
     ev = d.get('eventData') or {}
     sig = request.headers.get('monnify-signature') or d.get('transactionHash') or ''
     if not ev or not sig or not MONNIFY_SECRET_KEY:
         return jsonify({'ok': False}), 400
-    matched, tried = _monnify_sig_match(ev, sig, MONNIFY_SECRET_KEY, MONNIFY_API_KEY)
+    matched, tried = _monnify_sig_match(ev, sig, MONNIFY_SECRET_KEY, MONNIFY_API_KEY, raw)
     if not matched:
         # TEMP DEBUG (remove after webhook verified): echo what Monnify sent so the
         # signature inputs can be compared in the Monnify event log. No secrets here.
@@ -726,7 +735,7 @@ def monnify_webhook():
         return jsonify({'ok': True})
     # idempotent + atomic: transactionReference is UNIQUE; duplicates are ignored
     if credit_wallet_atomic(uid, amount, tx_ref, 'Wallet funding via bank transfer'):
-        return jsonify({'ok': True})
+        return jsonify({'ok': True, 'via': matched})  # TEMP DEBUG: show which sig method matched
     return jsonify({'ok': True, 'duplicate': True})
 
 @app.post('/api/fund-sync')
