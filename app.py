@@ -39,6 +39,9 @@ FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', '*')
 SMTP_USER         = os.environ.get('SMTP_USER', '')
 SMTP_APP_PASSWORD = os.environ.get('SMTP_APP_PASSWORD', '')
 SMTP_FROM_NAME    = os.environ.get('SMTP_FROM_NAME', 'SWEETVTU')
+# Brevo HTTPS API (preferred: Render free blocks SMTP ports 25/465/587)
+BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '').strip()
+BREVO_SENDER  = os.environ.get('BREVO_SENDER', 'sweetvtu@gmail.com').strip()
 
 LAGOS = timezone(timedelta(hours=1))
 
@@ -162,7 +165,22 @@ def get_user(uid):
 
 # ---------------- email verification ----------------
 def send_email(to_email, subject, body):
-    """Send an email via Gmail SMTP. Returns True on success."""
+    """Send an email. Prefers Brevo HTTPS API (works on Render free, where
+    outbound SMTP ports are blocked); falls back to Gmail SMTP otherwise.
+    Returns True on success."""
+    if BREVO_API_KEY:
+        try:
+            r = requests.post(
+                'https://api.brevo.com/v3/smtp/email',
+                headers={'api-key': BREVO_API_KEY, 'Content-Type': 'application/json',
+                         'Accept': 'application/json'},
+                json={'sender': {'name': SMTP_FROM_NAME, 'email': BREVO_SENDER},
+                      'to': [{'email': to_email}],
+                      'subject': subject, 'textContent': body},
+                timeout=20)
+            return 200 <= r.status_code < 300
+        except Exception:
+            return False
     if not SMTP_USER or not SMTP_APP_PASSWORD:
         return False
     try:
@@ -311,7 +329,8 @@ def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload):
 def config():
     return jsonify({'ok': True, 'paystack_public_key': PAYSTACK_PUBLIC,
                     'sandbox': SANDBOX, 'live': True,
-                    'smtp_ready': bool(SMTP_USER and SMTP_APP_PASSWORD)})
+                    'email_via': 'brevo' if BREVO_API_KEY else 'smtp',
+                    'email_ready': bool(BREVO_API_KEY or (SMTP_USER and SMTP_APP_PASSWORD))})
 
 @app.post('/api/signup')
 def signup():
