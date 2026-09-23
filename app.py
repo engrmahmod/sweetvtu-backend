@@ -3,16 +3,14 @@ SWEETVTU backend — real VTpass + Paystack integration.
 Holds API keys server-side (env vars). Never expose them to the frontend.
 
 Env vars:
-  VTPASS_API_KEY, VTPASS_PUBLIC_KEY, VTPASS_SECRET_KEY
-  VTPASS_SANDBOX=1 (use sandbox) or 0 (live)
-  PAYSTACK_SECRET_KEY
-  PAYSTACK_PUBLIC_KEY   (served to frontend via /api/config)
-  ADMIN_KEY             (protects /api/admin/*)
+  ADMIN_KEY             (protects /api/admin/* — env only, never admin-editable)
   DATABASE_URL          (optional postgres://... ; defaults to local sqlite)
   FRONTEND_ORIGIN       (comma-separated allowed origins, default *)
   SMTP_USER             (Gmail address used to send verification codes, e.g. sweetvtu@gmail.com)
   SMTP_APP_PASSWORD     (Gmail *app password*, not the login password)
   SMTP_FROM_NAME        (sender name shown on emails, default SWEETVTU)
+Provider keys (VTPASS_*, MONNIFY_*, BREVO_*, PAYSTACK_*) are seeded from env
+into the settings table at startup, then editable from the admin panel.
   PORT
 """
 import os, re, json, secrets, sqlite3, uuid, smtplib, hashlib, hmac, base64, time
@@ -26,22 +24,50 @@ from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # ---------------- config ----------------
-VTPASS_API_KEY    = os.environ.get('VTPASS_API_KEY', '')
-VTPASS_PUBLIC_KEY = os.environ.get('VTPASS_PUBLIC_KEY', '')
-VTPASS_SECRET_KEY = os.environ.get('VTPASS_SECRET_KEY', '')
-SANDBOX           = os.environ.get('VTPASS_SANDBOX', '1') == '1'
-VT_BASE = 'https://sandbox.vtpass.com/api' if SANDBOX else 'https://vtpass.com/api'
-PAYSTACK_SECRET = os.environ.get('PAYSTACK_SECRET_KEY', '')
-PAYSTACK_PUBLIC = os.environ.get('PAYSTACK_PUBLIC_KEY', '')
 ADMIN_KEY       = os.environ.get('ADMIN_KEY', '')
 DATABASE_URL    = os.environ.get('DATABASE_URL', '')
 FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', '*')
 SMTP_USER         = os.environ.get('SMTP_USER', '')
 SMTP_APP_PASSWORD = os.environ.get('SMTP_APP_PASSWORD', '')
 SMTP_FROM_NAME    = os.environ.get('SMTP_FROM_NAME', 'SWEETVTU')
-# Brevo HTTPS API (preferred: Render free blocks SMTP ports 25/465/587)
-BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '').strip()
-BREVO_SENDER  = os.environ.get('BREVO_SENDER', 'sweetvtu@gmail.com').strip()
+# MONNIFY_BVN stays env-only (rarely changed, not admin-editable)
+MONNIFY_BVN        = os.environ.get('MONNIFY_BVN', '').strip()
+
+# ---------------- runtime settings (admin-editable, stored in DB) ----------------
+# These 12 keys are seeded from env vars at startup, then editable from the
+# admin panel. ADMIN_KEY intentionally stays env-only.
+SETTINGS = {}
+SETTINGS_META = {
+    'VTPASS_API_KEY':     dict(group='VTpass',   label='API Key',      secret=True),
+    'VTPASS_PUBLIC_KEY':  dict(group='VTpass',   label='Public Key',   secret=True),
+    'VTPASS_SECRET_KEY':  dict(group='VTpass',   label='Secret Key',   secret=True),
+    'VTPASS_SANDBOX':     dict(group='VTpass',   label='Sandbox mode — 1 = test, 0 = LIVE', secret=False),
+    'MONNIFY_API_KEY':    dict(group='Monnify',  label='API Key',      secret=True),
+    'MONNIFY_SECRET_KEY': dict(group='Monnify',  label='Secret Key',   secret=True),
+    'MONNIFY_CONTRACT_CODE': dict(group='Monnify', label='Contract Code', secret=True),
+    'MONNIFY_SANDBOX':    dict(group='Monnify',  label='Sandbox mode — 1 = test, 0 = LIVE', secret=False),
+    'BREVO_API_KEY':      dict(group='Email',    label='Brevo API Key', secret=True),
+    'BREVO_SENDER':       dict(group='Email',    label='Sender email', secret=False),
+    'PAYSTACK_SECRET_KEY': dict(group='Paystack', label='Secret Key',  secret=True),
+    'PAYSTACK_PUBLIC_KEY': dict(group='Paystack', label='Public Key',  secret=False),
+}
+SETTINGS_ALLOW = set(SETTINGS_META)
+
+def S(key):
+    """Read a runtime setting (call-time, so admin edits apply without restart)."""
+    return SETTINGS.get(key, '')
+
+def vt_sandbox():
+    return S('VTPASS_SANDBOX') == '1'
+
+def vt_base():
+    return 'https://sandbox.vtpass.com/api' if vt_sandbox() else 'https://vtpass.com/api'
+
+def monnify_sandbox():
+    return S('MONNIFY_SANDBOX') == '1'
+
+def monnify_base():
+    return 'https://sandbox.monnify.com' if monnify_sandbox() else 'https://api.monnify.com'
 
 LAGOS = timezone(timedelta(hours=1))
 
@@ -134,16 +160,18 @@ def init_db():
         """CREATE TABLE IF NOT EXISTS plan_prices(
              variation_code TEXT PRIMARY KEY, sell_price REAL, cost_price REAL,
              label TEXT, updated TEXT)""",
-        """CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)""",
+        """CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT, updated_at TEXT)""",
     ]
     for s in stmts:
         run(s)
     # migrate older databases that lack the new columns
-    for col in ("email_verified INTEGER DEFAULT 0", "tx_pin_hash TEXT",
-                "monnify_ref TEXT", "monnify_acct TEXT",
-                "monnify_bank TEXT", "monnify_acct_name TEXT"):
+    for col, tbl in (("email_verified INTEGER DEFAULT 0", "users"),
+                     ("tx_pin_hash TEXT", "users"),
+                     ("monnify_ref TEXT", "users"), ("monnify_acct TEXT", "users"),
+                     ("monnify_bank TEXT", "users"), ("monnify_acct_name TEXT", "users"),
+                     ("updated_at TEXT", "settings")):
         try:
-            run(f"ALTER TABLE users ADD COLUMN {col}")
+            run(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except Exception:
             pass
     # Each Monnify account reference must belong to exactly one user.
@@ -156,6 +184,39 @@ def init_db():
         run("INSERT INTO settings(k,v) VALUES('margin','0')")
 
 init_db()
+
+def load_settings():
+    """Load runtime settings from DB into memory; seed missing keys from env."""
+    global SETTINGS
+    try:
+        rows = q("SELECT k, v FROM settings")
+        SETTINGS = {r['k']: r['v'] for r in rows if r['v'] is not None}
+    except Exception:
+        SETTINGS = {}
+    env_seed = {
+        'VTPASS_API_KEY': os.environ.get('VTPASS_API_KEY', ''),
+        'VTPASS_PUBLIC_KEY': os.environ.get('VTPASS_PUBLIC_KEY', ''),
+        'VTPASS_SECRET_KEY': os.environ.get('VTPASS_SECRET_KEY', ''),
+        'VTPASS_SANDBOX': os.environ.get('VTPASS_SANDBOX', '1'),
+        'MONNIFY_API_KEY': os.environ.get('MONNIFY_API_KEY', '').strip(),
+        'MONNIFY_SECRET_KEY': os.environ.get('MONNIFY_SECRET_KEY', '').strip(),
+        'MONNIFY_CONTRACT_CODE': os.environ.get('MONNIFY_CONTRACT_CODE', '').strip(),
+        'MONNIFY_SANDBOX': os.environ.get('MONNIFY_SANDBOX', '1'),
+        'BREVO_API_KEY': os.environ.get('BREVO_API_KEY', '').strip(),
+        'BREVO_SENDER': os.environ.get('BREVO_SENDER', 'sweetvtu@gmail.com').strip(),
+        'PAYSTACK_SECRET_KEY': os.environ.get('PAYSTACK_SECRET_KEY', ''),
+        'PAYSTACK_PUBLIC_KEY': os.environ.get('PAYSTACK_PUBLIC_KEY', ''),
+    }
+    for k, val in env_seed.items():
+        if k not in SETTINGS and val:
+            try:
+                run("INSERT INTO settings(k,v,updated_at) VALUES(?,?,?)",
+                    (k, val, now_iso()))
+            except Exception:
+                pass
+            SETTINGS[k] = val
+
+load_settings()
 
 # ---------------- helpers ----------------
 def now_iso():
@@ -195,13 +256,13 @@ def send_email(to_email, subject, body):
     """Send an email. Prefers Brevo HTTPS API (works on Render free, where
     outbound SMTP ports are blocked); falls back to Gmail SMTP otherwise.
     Returns True on success."""
-    if BREVO_API_KEY:
+    if S('BREVO_API_KEY'):
         try:
             r = requests.post(
                 'https://api.brevo.com/v3/smtp/email',
-                headers={'api-key': BREVO_API_KEY, 'Content-Type': 'application/json',
+                headers={'api-key': S('BREVO_API_KEY'), 'Content-Type': 'application/json',
                          'Accept': 'application/json'},
-                json={'sender': {'name': SMTP_FROM_NAME, 'email': BREVO_SENDER},
+                json={'sender': {'name': SMTP_FROM_NAME, 'email': S('BREVO_SENDER')},
                       'to': [{'email': to_email}],
                       'subject': subject, 'textContent': body},
                 timeout=20)
@@ -258,14 +319,14 @@ def pin_required(f):
 
 # ---------------- VTpass client ----------------
 def vt_get(path, params=None):
-    r = requests.get(VT_BASE + path, params=params,
-                     headers={'api-key': VTPASS_API_KEY, 'public-key': VTPASS_PUBLIC_KEY},
+    r = requests.get(vt_base() + path, params=params,
+                     headers={'api-key': S('VTPASS_API_KEY'), 'public-key': S('VTPASS_PUBLIC_KEY')},
                      timeout=30)
     return r.json()
 
 def vt_post(path, payload):
-    r = requests.post(VT_BASE + path, json=payload,
-                      headers={'api-key': VTPASS_API_KEY, 'secret-key': VTPASS_SECRET_KEY},
+    r = requests.post(vt_base() + path, json=payload,
+                      headers={'api-key': S('VTPASS_API_KEY'), 'secret-key': S('VTPASS_SECRET_KEY')},
                       timeout=45)
     return r.json()
 
@@ -354,10 +415,10 @@ def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload):
 # ---------------- public ----------------
 @app.get('/api/config')
 def config():
-    return jsonify({'ok': True, 'paystack_public_key': PAYSTACK_PUBLIC,
-                    'sandbox': SANDBOX, 'live': True,
-                    'email_via': 'brevo' if BREVO_API_KEY else 'smtp',
-                    'email_ready': bool(BREVO_API_KEY or (SMTP_USER and SMTP_APP_PASSWORD)),
+    return jsonify({'ok': True, 'paystack_public_key': S('PAYSTACK_PUBLIC_KEY'),
+                    'sandbox': vt_sandbox(), 'live': True,
+                    'email_via': 'brevo' if S('BREVO_API_KEY') else 'smtp',
+                    'email_ready': bool(S('BREVO_API_KEY') or (SMTP_USER and SMTP_APP_PASSWORD)),
                     'monnify_ready': monnify_configured(),
                     'fund_method': 'monnify'})
 
@@ -488,7 +549,7 @@ def fund_init():
                           json={'email': user['email'], 'amount': amount * 100,
                                 'reference': ref,
                                 'metadata': {'user_id': g.user_id, 'purpose': 'sweetvtu_wallet'}},
-                          headers={'Authorization': f'Bearer {PAYSTACK_SECRET}'}, timeout=30).json()
+                          headers={'Authorization': f'Bearer {S("PAYSTACK_SECRET_KEY")}'}, timeout=30).json()
     except Exception as e:
         return jsonify({'ok': False, 'error': 'Could not reach Paystack. Try again.'}), 502
     if not r.get('status'):
@@ -497,7 +558,7 @@ def fund_init():
            status,reference,created) VALUES(?, 'fund','paystack',?,?,'in','pending',?,?)""",
         (g.user_id, f'Wallet funding {ref}', amount, ref, now_iso()))
     return jsonify({'ok': True, 'authorization_url': r['data']['authorization_url'],
-                    'reference': ref, 'paystack_public_key': PAYSTACK_PUBLIC})
+                    'reference': ref, 'paystack_public_key': S('PAYSTACK_PUBLIC_KEY')})
 
 @app.post('/api/fund/verify')
 @auth
@@ -512,7 +573,7 @@ def fund_verify():
         return jsonify({'ok': True, 'already': True, 'user': get_user(g.user_id)})
     try:
         r = requests.get(f'https://api.paystack.co/transaction/verify/{ref}',
-                         headers={'Authorization': f'Bearer {PAYSTACK_SECRET}'}, timeout=30).json()
+                         headers={'Authorization': f'Bearer {S("PAYSTACK_SECRET_KEY")}'}, timeout=30).json()
     except Exception:
         return jsonify({'ok': False, 'error': 'Could not verify with Paystack. Try again.'}), 502
     data = r.get('data') or {}
@@ -526,23 +587,18 @@ def fund_verify():
     return jsonify({'ok': False, 'error': 'Payment was not successful.'}), 400
 
 # ---------------- wallet funding (Monnify reserved virtual accounts) ----------------
-MONNIFY_API_KEY    = os.environ.get('MONNIFY_API_KEY', '').strip()
-MONNIFY_SECRET_KEY = os.environ.get('MONNIFY_SECRET_KEY', '').strip()
-MONNIFY_CONTRACT   = os.environ.get('MONNIFY_CONTRACT_CODE', '').strip()
-MONNIFY_SANDBOX    = os.environ.get('MONNIFY_SANDBOX', '1') == '1'
-MONNIFY_BVN        = os.environ.get('MONNIFY_BVN', '').strip()
-MONNIFY_BASE       = 'https://sandbox.monnify.com' if MONNIFY_SANDBOX else 'https://api.monnify.com'
+# Keys/base now come from runtime settings: S('MONNIFY_*'), monnify_base().
 _monnify = {'token': None, 'exp': 0}
 
 def monnify_configured():
-    return bool(MONNIFY_API_KEY and MONNIFY_SECRET_KEY and MONNIFY_CONTRACT)
+    return bool(S('MONNIFY_API_KEY') and S('MONNIFY_SECRET_KEY') and S('MONNIFY_CONTRACT_CODE'))
 
 def monnify_token():
     """OAuth token for Monnify, cached until near expiry."""
     if _monnify['token'] and _monnify['exp'] > time.time() + 60:
         return _monnify['token']
-    creds = base64.b64encode(f'{MONNIFY_API_KEY}:{MONNIFY_SECRET_KEY}'.encode()).decode()
-    r = requests.post(f'{MONNIFY_BASE}/api/v1/auth/login',
+    creds = base64.b64encode(f"{S('MONNIFY_API_KEY')}:{S('MONNIFY_SECRET_KEY')}".encode()).decode()
+    r = requests.post(f'{monnify_base()}/api/v1/auth/login',
                       headers={'Authorization': f'Basic {creds}'}, timeout=20).json()
     body = r.get('responseBody') or {}
     tok = body.get('accessToken')
@@ -559,7 +615,7 @@ def monnify_token():
 @auth
 def monnify_status():
     return jsonify({'ok': True, 'configured': monnify_configured(),
-                    'sandbox': MONNIFY_SANDBOX})
+                    'sandbox': monnify_sandbox()})
 
 @app.post('/api/fund-account')
 @auth
@@ -573,7 +629,7 @@ def fund_account():
                         'bank_name': user['monnify_bank'],
                         'account_name': user['monnify_acct_name']})
     d = request.get_json(force=True, silent=True) or {}
-    bvn = (d.get('bvn') or '').strip() or MONNIFY_BVN or ('22222222222' if MONNIFY_SANDBOX else '')
+    bvn = (d.get('bvn') or '').strip() or MONNIFY_BVN or ('22222222222' if monnify_sandbox() else '')
     if not bvn:
         return jsonify({'ok': False, 'need_bvn': True,
                         'error': 'Your BVN is required to create your personal funding account.'}), 400
@@ -586,12 +642,12 @@ def fund_account():
     try:
         tok = monnify_token()
         r = requests.post(
-            f'{MONNIFY_BASE}/api/v2/bank-transfer/reserved-accounts',
+            f'{monnify_base()}/api/v2/bank-transfer/reserved-accounts',
             headers={'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'},
             json={'accountReference': ref,
                   'accountName': (user.get('name') or 'SWEETVTU Customer')[:40],
                   'currencyCode': 'NGN',
-                  'contractCode': MONNIFY_CONTRACT,
+                  'contractCode': S('MONNIFY_CONTRACT_CODE'),
                   'customerEmail': user.get('email'),
                   'customerName': user.get('name'),
                   'bvn': bvn,
@@ -612,7 +668,7 @@ def fund_account():
             # only if Monnify returns the exact reference we asked for.
             try:
                 g2 = requests.get(
-                    f'{MONNIFY_BASE}/api/v2/bank-transfer/reserved-accounts/{ref}',
+                    f'{monnify_base()}/api/v2/bank-transfer/reserved-accounts/{ref}',
                     headers={'Authorization': f'Bearer {tok}'}, timeout=30).json()
                 body2 = g2.get('responseBody') or {}
                 accts2 = body2.get('accounts') or []
@@ -764,7 +820,7 @@ def fund_sync():
     try:
         tok = monnify_token()
         r = requests.get(
-            f'{MONNIFY_BASE}/api/v1/bank-transfer/reserved-accounts/transactions',
+            f'{monnify_base()}/api/v1/bank-transfer/reserved-accounts/transactions',
             headers={'Authorization': f'Bearer {tok}'},
             params={'accountReference': acct_ref, 'page': 0, 'size': 20},
             timeout=30).json()
@@ -984,7 +1040,7 @@ def vt_balance():
 @admin_auth
 def admin_users():
     return jsonify({'ok': True, 'users': q(
-        "SELECT id,name,phone,email,wallet,created FROM users ORDER BY id DESC LIMIT 500")})
+        "SELECT id,name,phone,email,email_verified,wallet,created FROM users ORDER BY id DESC LIMIT 500")})
 
 @app.post('/api/admin/wallet')
 @admin_auth
@@ -1077,9 +1133,166 @@ def cost_check():
                             'cost': cost, 'sell': sell, 'loss': round(cost - sell, 2)})
     return jsonify({'ok': True, 'losing': out})
 
+# ---------------- runtime settings (admin-editable API keys) ----------------
+@app.get('/api/admin/settings')
+@admin_auth
+def admin_settings():
+    items = [{'key': k, 'group': m['group'], 'label': m['label'],
+              'secret': m['secret'], 'value': S(k)}
+             for k, m in SETTINGS_META.items()]
+    return jsonify({'ok': True, 'settings': items})
+
+@app.post('/api/admin/settings')
+@admin_auth
+def admin_settings_save():
+    d = request.get_json(force=True, silent=True) or {}
+    key = (d.get('key') or '').strip()
+    value = d.get('value')
+    if key not in SETTINGS_ALLOW:
+        return jsonify({'ok': False, 'error': 'That setting cannot be changed here.'}), 400
+    value = '' if value is None else str(value)
+    if key.endswith('_SANDBOX') and value not in ('0', '1'):
+        return jsonify({'ok': False, 'error': 'Sandbox must be 0 or 1.'}), 400
+    run("""INSERT INTO settings(k,v,updated_at) VALUES(?,?,?)
+           ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at""",
+        (key, value, now_iso()))
+    SETTINGS[key] = value
+    # Monnify caches its OAuth token per key-set; a key change must re-auth.
+    if key.startswith('MONNIFY_'):
+        _monnify['token'] = None
+        _monnify['exp'] = 0
+    return jsonify({'ok': True})
+
+@app.post('/api/admin/test-connection')
+@admin_auth
+def admin_test_connection():
+    d = request.get_json(force=True, silent=True) or {}
+    service = (d.get('service') or '').strip().lower()
+    try:
+        if service == 'vtpass':
+            if not (S('VTPASS_API_KEY') and S('VTPASS_PUBLIC_KEY')):
+                return jsonify({'ok': False, 'detail': 'API key / public key missing.'})
+            r = vt_get('/balance')
+            bal = (r.get('content') or {}).get('balance', r)
+            return jsonify({'ok': True, 'detail': f"Connected — wallet balance ₦{bal}."})
+        if service == 'monnify':
+            if not monnify_configured():
+                return jsonify({'ok': False, 'detail': 'API key / secret / contract code missing.'})
+            creds = base64.b64encode(
+                f"{S('MONNIFY_API_KEY')}:{S('MONNIFY_SECRET_KEY')}".encode()).decode()
+            r = requests.post(f'{monnify_base()}/api/v1/auth/login',
+                              headers={'Authorization': f'Basic {creds}'},
+                              timeout=20).json()
+            tok = (r.get('responseBody') or {}).get('accessToken')
+            if tok:
+                mode = 'sandbox' if monnify_sandbox() else 'LIVE'
+                return jsonify({'ok': True, 'detail': f'Auth OK ({mode}).'})
+            return jsonify({'ok': False,
+                            'detail': 'Auth failed: ' + str(r.get('responseMessage') or 'check keys')[:120]})
+        if service == 'brevo':
+            if not S('BREVO_API_KEY'):
+                return jsonify({'ok': False, 'detail': 'Brevo API key missing.'})
+            r = requests.get('https://api.brevo.com/v3/account',
+                             headers={'api-key': S('BREVO_API_KEY')}, timeout=20)
+            if r.status_code == 200:
+                j = r.json()
+                return jsonify({'ok': True,
+                                'detail': f"Connected — account {j.get('email', 'ok')}."})
+            return jsonify({'ok': False, 'detail': f'Brevo rejected the key (HTTP {r.status_code}).'})
+        return jsonify({'ok': False, 'detail': 'Unknown service.'}), 400
+    except Exception as e:
+        return jsonify({'ok': False, 'detail': 'Connection error: ' + str(e)[:120]})
+
+# ---------------- password reset ----------------
+@app.post('/api/forgot-password')
+def forgot_password():
+    d = request.get_json(force=True, silent=True) or {}
+    email = (d.get('email') or '').strip()
+    rows = q("SELECT id, name, email FROM users WHERE email=?", (email,))
+    if rows:
+        user = rows[0]
+        code = new_email_code(user['id'], 'reset')
+        send_email(user['email'], 'Reset your SWEETVTU password',
+                   f"Hello {user['name']},\n\nYour password reset code is:\n\n{code}\n\n"
+                   f"Enter it in the app with your new password. It expires in 15 minutes.\n\n"
+                   f"If you did not request this, ignore this email.\n\n— SWEETVTU")
+    # always ok — never reveal whether the email is registered
+    return jsonify({'ok': True})
+
+@app.post('/api/reset-password')
+def reset_password():
+    d = request.get_json(force=True, silent=True) or {}
+    email = (d.get('email') or '').strip()
+    code = str(d.get('code') or '').strip()
+    pw = d.get('new_password') or ''
+    if len(pw) < 4:
+        return jsonify({'ok': False, 'error': 'Password must be at least 4 characters.'}), 400
+    rows = q("SELECT id FROM users WHERE email=?", (email,))
+    if not rows:
+        return jsonify({'ok': False, 'error': 'Wrong code. Check the email and try again.'}), 400
+    uid = rows[0]['id']
+    chash = hashlib.sha256(code.encode()).hexdigest()
+    grows = q("SELECT expires_at FROM email_codes WHERE user_id=? AND purpose='reset' AND code_hash=?",
+              (uid, chash))
+    if not grows:
+        return jsonify({'ok': False, 'error': 'Wrong code. Check the email and try again.'}), 400
+    if grows[0]['expires_at'] < now_iso():
+        return jsonify({'ok': False, 'error': 'Code expired. Request a new one.'}), 400
+    run("UPDATE users SET pass_hash=? WHERE id=?", (generate_password_hash(pw), uid))
+    run("DELETE FROM email_codes WHERE user_id=? AND purpose='reset'", (uid,))
+    run("DELETE FROM tokens WHERE user_id=?", (uid,))  # kill old sessions
+    return jsonify({'ok': True})
+
+# ---------------- admin: user detail / password / delete ----------------
+@app.get('/api/admin/user')
+@admin_auth
+def admin_user():
+    try: uid = int(request.args.get('id') or 0)
+    except Exception: uid = 0
+    rows = q("SELECT id,name,phone,email,email_verified,wallet,created,"
+             "monnify_ref,monnify_acct,monnify_bank,monnify_acct_name "
+             "FROM users WHERE id=?", (uid,))
+    if not rows:
+        return jsonify({'ok': False, 'error': 'User not found.'}), 404
+    u = dict(rows[0])
+    cnt = q("SELECT COUNT(*) c FROM transactions WHERE user_id=?", (uid,))
+    u['tx_count'] = cnt[0]['c'] if cnt else 0
+    u['recent'] = q("SELECT id,type,service,description,amount,direction,status,reference,created "
+                    "FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 20", (uid,))
+    return jsonify({'ok': True, 'user': u})
+
+@app.post('/api/admin/user-password')
+@admin_auth
+def admin_user_password():
+    d = request.get_json(force=True, silent=True) or {}
+    try: uid = int(d.get('user_id') or 0)
+    except Exception: uid = 0
+    pw = d.get('new_password') or ''
+    if len(pw) < 4:
+        return jsonify({'ok': False, 'error': 'Password must be at least 4 characters.'}), 400
+    if not q("SELECT id FROM users WHERE id=?", (uid,)):
+        return jsonify({'ok': False, 'error': 'User not found.'}), 404
+    run("UPDATE users SET pass_hash=? WHERE id=?", (generate_password_hash(pw), uid))
+    run("DELETE FROM tokens WHERE user_id=?", (uid,))
+    return jsonify({'ok': True})
+
+@app.delete('/api/admin/user')
+@admin_auth
+def admin_user_delete():
+    d = request.get_json(force=True, silent=True) or {}
+    try: uid = int(d.get('user_id') or 0)
+    except Exception: uid = 0
+    if not q("SELECT id FROM users WHERE id=?", (uid,)):
+        return jsonify({'ok': False, 'error': 'User not found.'}), 404
+    run("DELETE FROM transactions WHERE user_id=?", (uid,))
+    run("DELETE FROM tokens WHERE user_id=?", (uid,))
+    run("DELETE FROM email_codes WHERE user_id=?", (uid,))
+    run("DELETE FROM users WHERE id=?", (uid,))
+    return jsonify({'ok': True})
+
 @app.get('/')
 def index():
-    return jsonify({'ok': True, 'service': 'SWEETVTU backend', 'sandbox': SANDBOX})
+    return jsonify({'ok': True, 'service': 'SWEETVTU backend', 'sandbox': vt_sandbox()})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
