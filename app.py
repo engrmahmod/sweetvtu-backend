@@ -216,11 +216,11 @@ def load_settings():
                 pass
             SETTINGS[k] = val
 
-load_settings()
-
 # ---------------- helpers ----------------
 def now_iso():
     return datetime.now(LAGOS).isoformat(timespec='seconds')
+
+load_settings()
 
 def request_id():
     stamp = datetime.now(LAGOS).strftime('%Y%m%d%H%M')
