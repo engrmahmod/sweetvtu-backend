@@ -589,7 +589,7 @@ def fund_account():
                     a2 = accts2[0]
                     run("""UPDATE users SET monnify_ref=?, monnify_acct=?, monnify_bank=?,
                            monnify_acct_name=? WHERE id=?""",
-                        (body2.get('reservationReference') or ref, a2.get('accountNumber'),
+                        (body2.get('accountReference') or ref, a2.get('accountNumber'),
                          a2.get('bankName'), a2.get('accountName'), g.user_id))
                     return jsonify({'ok': True, 'account_number': a2.get('accountNumber'),
                                     'bank_name': a2.get('bankName'),
@@ -600,7 +600,7 @@ def fund_account():
     a = accts[0]
     run("""UPDATE users SET monnify_ref=?, monnify_acct=?, monnify_bank=?, monnify_acct_name=?
            WHERE id=?""",
-        (body.get('reservationReference') or ref, a.get('accountNumber'),
+        (body.get('accountReference') or ref, a.get('accountNumber'),
          a.get('bankName'), a.get('accountName'), g.user_id))
     return jsonify({'ok': True, 'account_number': a.get('accountNumber'),
                     'bank_name': a.get('bankName'), 'account_name': a.get('accountName')})
@@ -680,20 +680,29 @@ def fund_sync():
     user = get_user(g.user_id)
     if not user.get('monnify_acct'):
         return jsonify({'ok': False, 'error': 'No funding account yet.'}), 400
-    acct_ref = user.get('monnify_ref') or f'sweetvtu-{g.user_id}'
+    # The deterministic reference is what we sent at creation; the stored ref
+    # is a backup. Try both so an old/stale stored value can't break sync.
+    refs = [f'sweetvtu-{g.user_id}']
+    if user.get('monnify_ref') and user['monnify_ref'] not in refs:
+        refs.append(user['monnify_ref'])
+    items = None
+    last_err = 'Monnify error: try again'
     try:
         tok = monnify_token()
-        r = requests.get(
-            f'{MONNIFY_BASE}/api/v1/bank-transfer/reserved-accounts/transactions',
-            headers={'Authorization': f'Bearer {tok}'},
-            params={'accountReference': acct_ref, 'page': 0, 'size': 20},
-            timeout=30).json()
+        for acct_ref in refs:
+            r = requests.get(
+                f'{MONNIFY_BASE}/api/v1/bank-transfer/reserved-accounts/transactions',
+                headers={'Authorization': f'Bearer {tok}'},
+                params={'accountReference': acct_ref, 'page': 0, 'size': 20},
+                timeout=30).json()
+            if r.get('requestSuccessful'):
+                items = (r.get('responseBody') or {}).get('content') or []
+                break
+            last_err = 'Monnify error: ' + str(r.get('responseMessage') or 'try again')
     except Exception:
         return jsonify({'ok': False, 'error': 'Could not reach Monnify. Try again.'}), 502
-    if not r.get('requestSuccessful'):
-        return jsonify({'ok': False,
-                        'error': 'Monnify error: ' + str(r.get('responseMessage') or 'try again')}), 502
-    items = (r.get('responseBody') or {}).get('content') or []
+    if items is None:
+        return jsonify({'ok': False, 'error': last_err}), 502
     credited = 0.0
     count = 0
     for it in items:
