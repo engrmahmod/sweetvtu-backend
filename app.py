@@ -1032,7 +1032,23 @@ def requery():
 @admin_auth
 def vt_balance():
     try:
-        return jsonify({'ok': True, 'balance': vt_get('/balance')})
+        raw = vt_get('/balance')
+        bal = None
+        if isinstance(raw, dict):
+            for key in ('contents', 'content', 'data'):
+                node = raw.get(key)
+                if isinstance(node, dict) and node.get('balance') is not None:
+                    bal = node.get('balance'); break
+                if isinstance(node, list) and node and isinstance(node[0], dict) \
+                        and node[0].get('balance') is not None:
+                    bal = node[0].get('balance'); break
+            if bal is None and raw.get('balance') is not None:
+                bal = raw.get('balance')
+        try: bal = float(bal)
+        except (TypeError, ValueError): bal = None
+        if bal is None:
+            return jsonify({'ok': False, 'error': 'Could not read balance.'}), 502
+        return jsonify({'ok': True, 'balance': bal})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 502
 
