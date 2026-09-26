@@ -1027,6 +1027,46 @@ def requery():
     if not rows: return jsonify({'ok': False, 'error': 'Unknown reference.'}), 404
     return jsonify({'ok': True, 'status': rows[0]['status'], 'provider_ref': rows[0]['provider_ref']})
 
+@app.get('/api/network-status')
+@auth
+def network_status():
+    """Live network health derived from OUR OWN recent VTpass transactions
+    (last 48h): per-network delivery success rate. Honest signal — no fake
+    'all operational' when our own orders are failing."""
+    cutoff = (datetime.now(LAGOS) - timedelta(hours=48)).isoformat(timespec='seconds')
+    try:
+        rows = q("""SELECT service, status, COUNT(*) AS c FROM transactions
+                    WHERE type IN ('airtime','data') AND direction='out' AND created >= ?
+                    GROUP BY service, status""", (cutoff,))
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    agg = {}
+    for r in rows:
+        svc = (r.get('service') or '').lower()
+        st = (r.get('status') or '').lower()
+        n = agg.setdefault(svc, {'ok': 0, 'fail': 0})
+        if st == 'successful':
+            n['ok'] += r['c']
+        elif st in ('failed', 'refunded'):
+            n['fail'] += r['c']
+    out = []
+    for key, label in (('mtn', 'MTN'), ('airtel', 'Airtel'), ('glo', 'Glo'), ('etisalat', '9mobile')):
+        n = agg.get(key, {'ok': 0, 'fail': 0})
+        total = n['ok'] + n['fail']
+        if total == 0:
+            status, note = 'nodata', 'No recent orders'
+        else:
+            rate = n['ok'] / total
+            if rate >= 0.9:
+                status, note = 'operational', f'{n["ok"]}/{total} recent orders delivered'
+            elif rate >= 0.5:
+                status, note = 'degraded', f'{n["ok"]}/{total} recent orders delivered'
+            else:
+                status, note = 'down', f'{n["fail"]}/{total} recent orders failed'
+        out.append({'key': key, 'network': label, 'status': status, 'note': note,
+                    'ok': n['ok'], 'total': total})
+    return jsonify({'ok': True, 'window': '48h', 'networks': out})
+
 # ---------------- admin ----------------
 @app.get('/api/admin/vtpass-balance')
 @admin_auth
