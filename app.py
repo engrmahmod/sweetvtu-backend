@@ -74,6 +74,30 @@ LAGOS = timezone(timedelta(hours=1))
 app = Flask(__name__)
 CORS(app, origins=[o.strip() for o in FRONTEND_ORIGIN.split(',')])
 
+# ---------------- rate limiting ----------------
+# Protects auth, money and admin endpoints from brute force / abuse.
+# Runs behind Render's proxy, so the real client IP comes from X-Forwarded-For.
+from flask_limiter import Limiter
+
+def _client_ip():
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+limiter = Limiter(
+    key_func=_client_ip,
+    app=app,
+    default_limits=['240 per minute'],
+    storage_uri='memory://',
+    headers_enabled=True,
+    strategy='fixed-window',
+)
+
+@app.errorhandler(429)
+def _ratelimit_handler(e):
+    return jsonify({'ok': False, 'error': 'Too many requests. Slow down and try again.'}), 429
+
 # ---------------- db ----------------
 USE_PG = DATABASE_URL.startswith('postgres')
 _pg = None
@@ -423,6 +447,7 @@ def config():
                     'fund_method': 'monnify'})
 
 @app.post('/api/signup')
+@limiter.limit('5 per minute')
 def signup():
     d = request.get_json(force=True)
     name, phone, email, pw = (d.get('name') or '').strip(), (d.get('phone') or '').strip(), \
@@ -447,6 +472,7 @@ def signup():
                     'email': email, 'email_sent': email_sent})
 
 @app.post('/api/verify-email')
+@limiter.limit('10 per minute')
 def verify_email():
     d = request.get_json(force=True)
     try: uid = int(d.get('user_id') or 0)
@@ -472,6 +498,7 @@ def verify_email():
     return jsonify({'ok': True, 'token': tok, 'user': get_user(uid)})
 
 @app.post('/api/resend-code')
+@limiter.limit('3 per minute')
 def resend_code():
     d = request.get_json(force=True)
     try: uid = int(d.get('user_id') or 0)
@@ -487,6 +514,7 @@ def resend_code():
     return jsonify({'ok': True})
 
 @app.post('/api/change-pin')
+@limiter.limit('10 per minute')
 @auth
 def change_pin():
     d = request.get_json(force=True)
@@ -501,6 +529,7 @@ def change_pin():
     return jsonify({'ok': True})
 
 @app.post('/api/login')
+@limiter.limit('10 per minute')
 def login():
     d = request.get_json(force=True)
     phone, pw = (d.get('phone') or '').strip(), d.get('password') or ''
@@ -535,6 +564,7 @@ def history():
 
 # ---------------- wallet funding (Paystack) ----------------
 @app.post('/api/fund/initialize')
+@limiter.limit('20 per minute')
 @auth
 def fund_init():
     d = request.get_json(force=True)
@@ -561,6 +591,7 @@ def fund_init():
                     'reference': ref, 'paystack_public_key': S('PAYSTACK_PUBLIC_KEY')})
 
 @app.post('/api/fund/verify')
+@limiter.limit('20 per minute')
 @auth
 def fund_verify():
     d = request.get_json(force=True)
@@ -618,6 +649,7 @@ def monnify_status():
                     'sandbox': monnify_sandbox()})
 
 @app.post('/api/fund-account')
+@limiter.limit('20 per minute')
 @auth
 def fund_account():
     """Return the user's personal Monnify virtual account, creating it on first use."""
@@ -758,6 +790,7 @@ def _monnify_sig_ok(sig, secret, raw_body):
 
 
 @app.post('/api/monnify-webhook')
+@limiter.exempt
 def monnify_webhook():
     """Monnify payment notification. Verifies HMAC-SHA512 signature, credits
     wallet exactly once. The customer is resolved ONLY by exact match of the
@@ -801,6 +834,7 @@ def monnify_webhook():
     return jsonify({'ok': True, 'status': status})
 
 @app.post('/api/fund-sync')
+@limiter.limit('20 per minute')
 @auth
 def fund_sync():
     """Pull the user's Monnify reserved-account transactions (server-to-server)
@@ -880,6 +914,7 @@ DISCOS = [
 ]
 
 @app.post('/api/buy/airtime')
+@limiter.limit('20 per minute')
 @auth
 @pin_required
 def buy_airtime():
@@ -911,6 +946,7 @@ def data_plans():
     return jsonify({'ok': True, 'plans': plans})
 
 @app.post('/api/buy/data')
+@limiter.limit('20 per minute')
 @auth
 @pin_required
 def buy_data():
@@ -945,6 +981,7 @@ def cable_plans():
     return jsonify({'ok': True, 'plans': plans})
 
 @app.post('/api/verify')
+@limiter.limit('20 per minute')
 @auth
 def verify():
     d = request.get_json(force=True)
@@ -966,6 +1003,7 @@ def verify():
     return jsonify({'ok': False, 'error': 'Could not verify this number. Check and try again.'}), 400
 
 @app.post('/api/buy/cable')
+@limiter.limit('20 per minute')
 @auth
 @pin_required
 def buy_cable():
@@ -1000,6 +1038,7 @@ def discos():
     return jsonify({'ok': True, 'discos': out})
 
 @app.post('/api/buy/power')
+@limiter.limit('20 per minute')
 @auth
 @pin_required
 def buy_power():
@@ -1019,6 +1058,7 @@ def buy_power():
     return jsonify({'ok': ok, **info})
 
 @app.post('/api/requery')
+@limiter.limit('10 per minute')
 @auth
 def requery():
     d = request.get_json(force=True)
@@ -1261,6 +1301,7 @@ def admin_test_connection():
 
 # ---------------- password reset ----------------
 @app.post('/api/forgot-password')
+@limiter.limit('5 per minute')
 def forgot_password():
     d = request.get_json(force=True, silent=True) or {}
     email = (d.get('email') or '').strip()
@@ -1276,6 +1317,7 @@ def forgot_password():
     return jsonify({'ok': True})
 
 @app.post('/api/reset-password')
+@limiter.limit('10 per minute')
 def reset_password():
     d = request.get_json(force=True, silent=True) or {}
     email = (d.get('email') or '').strip()
