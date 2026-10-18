@@ -124,6 +124,9 @@ def q(sql, params=()):
         try:
             cur.execute(sql, params)
             rows = cur.fetchall()
+            # Commit after reads so the connection never sits idle-in-transaction
+            # holding locks (this hung deploys waiting on ALTER TABLE).
+            db().commit()
         except Exception:
             try:
                 db().rollback()
@@ -163,6 +166,75 @@ def run(sql, params=()):
         con.commit()
         con.close()
 
+
+# ---------------- non-blocking security migration ----------------
+# The tokens/users security columns are added with a short lock timeout so a
+# blocked ALTER fails fast instead of hanging gunicorn startup (which made
+# Render deploys time out). NEW_COLS_READY gates the new session/PIN logic;
+# a background thread retries until the columns exist.
+NEW_COLS_READY = False
+_SECURITY_COLS = (
+    ("expires_at TEXT", "tokens"),
+    ("last_seen TEXT", "tokens"),
+    ("pin_fails INTEGER DEFAULT 0", "users"),
+    ("pin_locked_until TEXT", "users"),
+)
+
+def _try_security_migration():
+    """Try to add the security columns. Never blocks: uses a short lock
+    timeout and never raises. Returns True if the columns are present."""
+    global NEW_COLS_READY
+    try:
+        if USE_PG:
+            try:
+                run("SET lock_timeout = '8s'")
+            except Exception:
+                pass
+        for col, tbl in _SECURITY_COLS:
+            try:
+                run(f"ALTER TABLE {tbl} ADD COLUMN {col}")
+            except Exception:
+                pass
+        if USE_PG:
+            try:
+                run("SET lock_timeout = '0'")
+            except Exception:
+                pass
+        # verify the columns actually exist
+        try:
+            if USE_PG:
+                rows = q("SELECT column_name FROM information_schema.columns "
+                         "WHERE table_name='tokens' AND column_name='last_seen'")
+            else:
+                rows = q("PRAGMA table_info(tokens)")
+                rows = [r for r in rows if r.get('name') == 'last_seen']
+            if rows:
+                NEW_COLS_READY = True
+                return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+def _start_migration_retry_thread():
+    """Retry the security migration in the background until it succeeds."""
+    import threading, time
+    def loop():
+        for _ in range(60):
+            time.sleep(60)
+            if NEW_COLS_READY:
+                break
+            try:
+                if _try_security_migration():
+                    break
+            except Exception:
+                pass
+    try:
+        threading.Thread(target=loop, daemon=True).start()
+    except Exception:
+        pass
+
 def init_db():
     auto = "SERIAL PRIMARY KEY" if USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
     stmts = [
@@ -193,14 +265,15 @@ def init_db():
                      ("tx_pin_hash TEXT", "users"),
                      ("monnify_ref TEXT", "users"), ("monnify_acct TEXT", "users"),
                      ("monnify_bank TEXT", "users"), ("monnify_acct_name TEXT", "users"),
-                     ("updated_at TEXT", "settings"),
-                     ("expires_at TEXT", "tokens"), ("last_seen TEXT", "tokens"),
-                     ("pin_fails INTEGER DEFAULT 0", "users"),
-                     ("pin_locked_until TEXT", "users")):
+                     ("updated_at TEXT", "settings")):
         try:
             run(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except Exception:
             pass
+    # New security columns are migrated separately (non-blocking) so a
+    # locked ALTER can never hang the deploy. See _try_security_migration().
+    _try_security_migration()
+    _start_migration_retry_thread()
     # Each Monnify account reference must belong to exactly one user.
     # (NULLs are allowed multiple times on both SQLite and Postgres.)
     try:
@@ -257,9 +330,12 @@ def new_session_token(uid):
     """Create a login token with absolute expiry and activity tracking."""
     tok = secrets.token_hex(24)
     now = now_iso()
-    exp = (datetime.now(LAGOS) + timedelta(days=SESSION_ABS_DAYS)).isoformat(timespec='seconds')
-    run("INSERT INTO tokens(token,user_id,created,expires_at,last_seen) VALUES(?,?,?,?,?)",
-        (tok, uid, now, exp, now))
+    if NEW_COLS_READY:
+        exp = (datetime.now(LAGOS) + timedelta(days=SESSION_ABS_DAYS)).isoformat(timespec='seconds')
+        run("INSERT INTO tokens(token,user_id,created,expires_at,last_seen) VALUES(?,?,?,?,?)",
+            (tok, uid, now, exp, now))
+    else:
+        run("INSERT INTO tokens(token,user_id,created) VALUES(?,?,?)", (tok, uid, now))
     return tok
 
 load_settings()
@@ -274,20 +350,25 @@ def auth(f):
         tok = (request.headers.get('Authorization') or '').replace('Bearer ', '').strip()
         if not tok:
             return jsonify({'ok': False, 'error': 'Not signed in.'}), 401
-        rows = q("SELECT user_id, expires_at, last_seen FROM tokens WHERE token=?", (tok,))
+        if NEW_COLS_READY:
+            rows = q("SELECT user_id, expires_at, last_seen FROM tokens WHERE token=?", (tok,))
+        else:
+            # security migration pending: fall back to plain token check
+            rows = q("SELECT user_id FROM tokens WHERE token=?", (tok,))
         if not rows:
             return jsonify({'ok': False, 'error': 'Session expired. Sign in again.'}), 401
-        now = now_iso()
-        # absolute session lifetime (30 days)
-        if rows[0].get('expires_at') and rows[0]['expires_at'] < now:
-            run("DELETE FROM tokens WHERE token=?", (tok,))
-            return jsonify({'ok': False, 'error': 'Session expired. Sign in again.'}), 401
-        # inactivity logout (3 minutes)
-        cutoff = (datetime.now(LAGOS) - timedelta(seconds=SESSION_IDLE_SECS)).isoformat(timespec='seconds')
-        if rows[0].get('last_seen') and rows[0]['last_seen'] < cutoff:
-            run("DELETE FROM tokens WHERE token=?", (tok,))
-            return jsonify({'ok': False, 'error': 'Signed out after 3 minutes of inactivity.'}), 401
-        run("UPDATE tokens SET last_seen=? WHERE token=?", (now, tok))
+        if NEW_COLS_READY:
+            now = now_iso()
+            # absolute session lifetime (30 days)
+            if rows[0].get('expires_at') and rows[0]['expires_at'] < now:
+                run("DELETE FROM tokens WHERE token=?", (tok,))
+                return jsonify({'ok': False, 'error': 'Session expired. Sign in again.'}), 401
+            # inactivity logout (3 minutes)
+            cutoff = (datetime.now(LAGOS) - timedelta(seconds=SESSION_IDLE_SECS)).isoformat(timespec='seconds')
+            if rows[0].get('last_seen') and rows[0]['last_seen'] < cutoff:
+                run("DELETE FROM tokens WHERE token=?", (tok,))
+                return jsonify({'ok': False, 'error': 'Signed out after 3 minutes of inactivity.'}), 401
+            run("UPDATE tokens SET last_seen=? WHERE token=?", (now, tok))
         g.user_id = rows[0]['user_id']
         return f(*a, **kw)
     return wrapper
@@ -362,12 +443,18 @@ def pin_required(f):
     @wraps(f)
     def wrapper(*a, **kw):
         d = request.get_json(force=True, silent=True) or {}
-        rows = q("SELECT tx_pin_hash, pin_fails, pin_locked_until FROM users WHERE id=?", (g.user_id,))
-        if rows and rows[0].get('pin_locked_until') and rows[0]['pin_locked_until'] > now_iso():
+        if NEW_COLS_READY:
+            rows = q("SELECT tx_pin_hash, pin_fails, pin_locked_until FROM users WHERE id=?", (g.user_id,))
+        else:
+            # security migration pending: plain PIN check, no lockout
+            rows = q("SELECT tx_pin_hash FROM users WHERE id=?", (g.user_id,))
+        if NEW_COLS_READY and rows and rows[0].get('pin_locked_until') and rows[0]['pin_locked_until'] > now_iso():
             return jsonify({'ok': False, 'error': 'Too many wrong PIN attempts. Try again in 15 minutes.'}), 403
         good = bool(rows and rows[0]['tx_pin_hash']) and \
             check_password_hash(rows[0]['tx_pin_hash'], str(d.get('pin') or ''))
         if not good:
+            if not NEW_COLS_READY:
+                return jsonify({'ok': False, 'error': 'Wrong transaction PIN.'}), 403
             fails = (rows[0].get('pin_fails') or 0) + 1 if rows else 1
             if fails >= PIN_MAX_FAILS:
                 lock_until = (datetime.now(LAGOS) + timedelta(seconds=PIN_LOCK_SECS)).isoformat(timespec='seconds')
@@ -376,7 +463,8 @@ def pin_required(f):
             run("UPDATE users SET pin_fails=? WHERE id=?", (fails, g.user_id))
             left = PIN_MAX_FAILS - fails
             return jsonify({'ok': False, 'error': f'Wrong transaction PIN. {left} attempt(s) left.'}), 403
-        run("UPDATE users SET pin_fails=0, pin_locked_until=NULL WHERE id=?", (g.user_id,))
+        if NEW_COLS_READY:
+            run("UPDATE users SET pin_fails=0, pin_locked_until=NULL WHERE id=?", (g.user_id,))
         return f(*a, **kw)
     return wrapper
 
@@ -835,9 +923,9 @@ def monnify_webhook():
     d = request.get_json(force=True, silent=True) or {}
     ev = d.get('eventData') or {}
     sig = request.headers.get('monnify-signature') or d.get('transactionHash') or ''
-    if not ev or not sig or not MONNIFY_SECRET_KEY:
+    if not ev or not sig or not S('MONNIFY_SECRET_KEY'):
         return jsonify({'ok': False}), 400
-    if not _monnify_sig_ok(sig, MONNIFY_SECRET_KEY, raw):
+    if not _monnify_sig_ok(sig, S('MONNIFY_SECRET_KEY'), raw):
         return jsonify({'ok': False}), 401
     if d.get('eventType') != 'SUCCESSFUL_TRANSACTION' or ev.get('paymentStatus') != 'PAID':
         return jsonify({'ok': True})
