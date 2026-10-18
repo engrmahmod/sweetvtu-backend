@@ -201,15 +201,22 @@ def _try_security_migration():
                 run("SET lock_timeout = '0'")
             except Exception:
                 pass
-        # verify the columns actually exist
+        # verify ALL security columns actually exist
         try:
             if USE_PG:
-                rows = q("SELECT column_name FROM information_schema.columns "
-                         "WHERE table_name='tokens' AND column_name='last_seen'")
+                rows = q("SELECT table_name, column_name FROM information_schema.columns "
+                         "WHERE (table_name='tokens' AND column_name IN ('expires_at','last_seen')) "
+                         "OR (table_name='users' AND column_name IN ('pin_fails','pin_locked_until','last_login_ip'))")
+                found = {(r['table_name'], r['column_name']) for r in rows}
+                need = {('tokens','expires_at'), ('tokens','last_seen'),
+                        ('users','pin_fails'), ('users','pin_locked_until'), ('users','last_login_ip')}
             else:
-                rows = q("PRAGMA table_info(tokens)")
-                rows = [r for r in rows if r.get('name') == 'last_seen']
-            if rows:
+                trows = [r['name'] for r in q("PRAGMA table_info(tokens)")]
+                urows = [r['name'] for r in q("PRAGMA table_info(users)")]
+                found = {('tokens',c) for c in trows} | {('users',c) for c in urows}
+                need = {('tokens','expires_at'), ('tokens','last_seen'),
+                        ('users','pin_fails'), ('users','pin_locked_until'), ('users','last_login_ip')}
+            if need.issubset(found):
                 NEW_COLS_READY = True
                 return True
         except Exception:
