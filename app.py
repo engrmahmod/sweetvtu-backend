@@ -193,7 +193,10 @@ def init_db():
                      ("tx_pin_hash TEXT", "users"),
                      ("monnify_ref TEXT", "users"), ("monnify_acct TEXT", "users"),
                      ("monnify_bank TEXT", "users"), ("monnify_acct_name TEXT", "users"),
-                     ("updated_at TEXT", "settings")):
+                     ("updated_at TEXT", "settings"),
+                     ("expires_at TEXT", "tokens"), ("last_seen TEXT", "tokens"),
+                     ("pin_fails INTEGER DEFAULT 0", "users"),
+                     ("pin_locked_until TEXT", "users")):
         try:
             run(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except Exception:
@@ -244,6 +247,21 @@ def load_settings():
 def now_iso():
     return datetime.now(LAGOS).isoformat(timespec='seconds')
 
+# ---------------- session security ----------------
+SESSION_ABS_DAYS = 30      # absolute max session lifetime
+SESSION_IDLE_SECS = 180    # inactivity logout (3 minutes)
+PIN_MAX_FAILS = 5          # wrong PIN attempts before lockout
+PIN_LOCK_SECS = 900        # PIN lockout duration (15 minutes)
+
+def new_session_token(uid):
+    """Create a login token with absolute expiry and activity tracking."""
+    tok = secrets.token_hex(24)
+    now = now_iso()
+    exp = (datetime.now(LAGOS) + timedelta(days=SESSION_ABS_DAYS)).isoformat(timespec='seconds')
+    run("INSERT INTO tokens(token,user_id,created,expires_at,last_seen) VALUES(?,?,?,?,?)",
+        (tok, uid, now, exp, now))
+    return tok
+
 load_settings()
 
 def request_id():
@@ -256,9 +274,20 @@ def auth(f):
         tok = (request.headers.get('Authorization') or '').replace('Bearer ', '').strip()
         if not tok:
             return jsonify({'ok': False, 'error': 'Not signed in.'}), 401
-        rows = q("SELECT user_id FROM tokens WHERE token=?", (tok,))
+        rows = q("SELECT user_id, expires_at, last_seen FROM tokens WHERE token=?", (tok,))
         if not rows:
             return jsonify({'ok': False, 'error': 'Session expired. Sign in again.'}), 401
+        now = now_iso()
+        # absolute session lifetime (30 days)
+        if rows[0].get('expires_at') and rows[0]['expires_at'] < now:
+            run("DELETE FROM tokens WHERE token=?", (tok,))
+            return jsonify({'ok': False, 'error': 'Session expired. Sign in again.'}), 401
+        # inactivity logout (3 minutes)
+        cutoff = (datetime.now(LAGOS) - timedelta(seconds=SESSION_IDLE_SECS)).isoformat(timespec='seconds')
+        if rows[0].get('last_seen') and rows[0]['last_seen'] < cutoff:
+            run("DELETE FROM tokens WHERE token=?", (tok,))
+            return jsonify({'ok': False, 'error': 'Signed out after 3 minutes of inactivity.'}), 401
+        run("UPDATE tokens SET last_seen=? WHERE token=?", (now, tok))
         g.user_id = rows[0]['user_id']
         return f(*a, **kw)
     return wrapper
@@ -333,11 +362,21 @@ def pin_required(f):
     @wraps(f)
     def wrapper(*a, **kw):
         d = request.get_json(force=True, silent=True) or {}
-        rows = q("SELECT tx_pin_hash FROM users WHERE id=?", (g.user_id,))
+        rows = q("SELECT tx_pin_hash, pin_fails, pin_locked_until FROM users WHERE id=?", (g.user_id,))
+        if rows and rows[0].get('pin_locked_until') and rows[0]['pin_locked_until'] > now_iso():
+            return jsonify({'ok': False, 'error': 'Too many wrong PIN attempts. Try again in 15 minutes.'}), 403
         good = bool(rows and rows[0]['tx_pin_hash']) and \
             check_password_hash(rows[0]['tx_pin_hash'], str(d.get('pin') or ''))
         if not good:
-            return jsonify({'ok': False, 'error': 'Wrong transaction PIN.'}), 403
+            fails = (rows[0].get('pin_fails') or 0) + 1 if rows else 1
+            if fails >= PIN_MAX_FAILS:
+                lock_until = (datetime.now(LAGOS) + timedelta(seconds=PIN_LOCK_SECS)).isoformat(timespec='seconds')
+                run("UPDATE users SET pin_fails=0, pin_locked_until=? WHERE id=?", (lock_until, g.user_id))
+                return jsonify({'ok': False, 'error': 'Too many wrong PIN attempts. Try again in 15 minutes.'}), 403
+            run("UPDATE users SET pin_fails=? WHERE id=?", (fails, g.user_id))
+            left = PIN_MAX_FAILS - fails
+            return jsonify({'ok': False, 'error': f'Wrong transaction PIN. {left} attempt(s) left.'}), 403
+        run("UPDATE users SET pin_fails=0, pin_locked_until=NULL WHERE id=?", (g.user_id,))
         return f(*a, **kw)
     return wrapper
 
@@ -482,8 +521,7 @@ def verify_email():
     if not user:
         return jsonify({'ok': False, 'error': 'Account not found. Sign up again.'}), 404
     if user.get('email_verified'):
-        tok = secrets.token_hex(24)
-        run("INSERT INTO tokens(token,user_id,created) VALUES(?,?,?)", (tok, uid, now_iso()))
+        tok = new_session_token(uid)
         return jsonify({'ok': True, 'token': tok, 'user': user})
     rows = q("SELECT * FROM email_codes WHERE user_id=? AND purpose='verify'", (uid,))
     chash = hashlib.sha256(code.encode()).hexdigest()
@@ -493,8 +531,7 @@ def verify_email():
         return jsonify({'ok': False, 'error': 'Code expired. Tap resend for a new one.'}), 400
     run("UPDATE users SET email_verified=1 WHERE id=?", (uid,))
     run("DELETE FROM email_codes WHERE user_id=? AND purpose='verify'", (uid,))
-    tok = secrets.token_hex(24)
-    run("INSERT INTO tokens(token,user_id,created) VALUES(?,?,?)", (tok, uid, now_iso()))
+    tok = new_session_token(uid)
     return jsonify({'ok': True, 'token': tok, 'user': get_user(uid)})
 
 @app.post('/api/resend-code')
@@ -539,8 +576,7 @@ def login():
     if not rows[0].get('email_verified'):
         return jsonify({'ok': False, 'error': 'Please verify your email first — check your inbox for the code.',
                         'verify_required': True, 'user_id': rows[0]['id']}), 403
-    tok = secrets.token_hex(24)
-    run("INSERT INTO tokens(token,user_id,created) VALUES(?,?,?)", (tok, rows[0]['id'], now_iso()))
+    tok = new_session_token(rows[0]['id'])
     return jsonify({'ok': True, 'token': tok, 'user': get_user(rows[0]['id'])})
 
 @app.post('/api/logout')
