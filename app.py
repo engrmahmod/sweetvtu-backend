@@ -13,7 +13,7 @@ Provider keys (VTPASS_*, MONNIFY_*, BREVO_*, PAYSTACK_*) are seeded from env
 into the settings table at startup, then editable from the admin panel.
   PORT
 """
-import os, re, json, secrets, sqlite3, uuid, smtplib, hashlib, hmac, base64, time
+import os, re, json, secrets, sqlite3, uuid, smtplib, hashlib, hmac, base64, time, threading
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from email.mime.text import MIMEText
@@ -680,13 +680,16 @@ def login():
             ip = fwd or (request.remote_addr or '')
             prev_ip = rows[0].get('last_login_ip')
             if ip and prev_ip and ip != prev_ip and rows[0].get('email'):
-                send_email(rows[0]['email'],
+                # Send in background so login stays fast.
+                _em, _nm = rows[0]['email'], rows[0].get('name') or 'there'
+                threading.Thread(target=send_email, args=(_em,
                            'New sign-in to your SWEETVTU account',
-                           f"Hi {rows[0].get('name') or 'there'},\n\n"
+                           f"Hi {_nm},\n\n"
                            f"We noticed a new sign-in to your SWEETVTU account on {now_iso()} "
                            f"from IP address {ip}.\n\n"
                            f"If this was you, no action is needed. If you don't recognize this "
-                           f"sign-in, change your password immediately and contact support.")
+                           f"sign-in, change your password immediately and contact support."),
+                           daemon=True).start()
             if ip:
                 run("UPDATE users SET last_login_ip=? WHERE id=?", (ip, rows[0]['id']))
     except Exception:
