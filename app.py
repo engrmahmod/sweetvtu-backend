@@ -583,7 +583,7 @@ def signup():
     if len(name) < 3: return jsonify({'ok': False, 'error': 'Please enter your full name.'}), 400
     if not re.match(r'^0\d{10}$', phone): return jsonify({'ok': False, 'error': 'Enter a valid 11-digit phone number.'}), 400
     if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email): return jsonify({'ok': False, 'error': 'Enter a valid email address.'}), 400
-    if len(pw) < 4: return jsonify({'ok': False, 'error': 'Password must be at least 4 characters.'}), 400
+    if len(pw) < 8: return jsonify({'ok': False, 'error': 'Password must be at least 8 characters.'}), 400
     if not re.match(r'^\d{4}$', pin):
         return jsonify({'ok': False, 'error': 'Create a 4-digit transaction PIN.'}), 400
     if q("SELECT id FROM users WHERE phone=?", (phone,)):
@@ -1447,8 +1447,8 @@ def reset_password():
     email = (d.get('email') or '').strip()
     code = str(d.get('code') or '').strip()
     pw = d.get('new_password') or ''
-    if len(pw) < 4:
-        return jsonify({'ok': False, 'error': 'Password must be at least 4 characters.'}), 400
+    if len(pw) < 8:
+        return jsonify({'ok': False, 'error': 'Password must be at least 8 characters.'}), 400
     rows = q("SELECT id FROM users WHERE email=?", (email,))
     if not rows:
         return jsonify({'ok': False, 'error': 'Wrong code. Check the email and try again.'}), 400
@@ -1490,8 +1490,8 @@ def admin_user_password():
     try: uid = int(d.get('user_id') or 0)
     except Exception: uid = 0
     pw = d.get('new_password') or ''
-    if len(pw) < 4:
-        return jsonify({'ok': False, 'error': 'Password must be at least 4 characters.'}), 400
+    if len(pw) < 8:
+        return jsonify({'ok': False, 'error': 'Password must be at least 8 characters.'}), 400
     if not q("SELECT id FROM users WHERE id=?", (uid,)):
         return jsonify({'ok': False, 'error': 'User not found.'}), 404
     run("UPDATE users SET pass_hash=? WHERE id=?", (generate_password_hash(pw), uid))
