@@ -178,6 +178,7 @@ _SECURITY_COLS = (
     ("last_seen TEXT", "tokens"),
     ("pin_fails INTEGER DEFAULT 0", "users"),
     ("pin_locked_until TEXT", "users"),
+    ("last_login_ip TEXT", "users"),
 )
 
 def _try_security_migration():
@@ -665,6 +666,24 @@ def login():
         return jsonify({'ok': False, 'error': 'Please verify your email first — check your inbox for the code.',
                         'verify_required': True, 'user_id': rows[0]['id']}), 403
     tok = new_session_token(rows[0]['id'])
+    # Login alert: email the user if this sign-in comes from a new IP address.
+    try:
+        if NEW_COLS_READY:
+            fwd = (request.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+            ip = fwd or (request.remote_addr or '')
+            prev_ip = rows[0].get('last_login_ip')
+            if ip and prev_ip and ip != prev_ip and rows[0].get('email'):
+                send_email(rows[0]['email'],
+                           'New sign-in to your SWEETVTU account',
+                           f"Hi {rows[0].get('name') or 'there'},\n\n"
+                           f"We noticed a new sign-in to your SWEETVTU account on {now_iso()} "
+                           f"from IP address {ip}.\n\n"
+                           f"If this was you, no action is needed. If you don't recognize this "
+                           f"sign-in, change your password immediately and contact support.")
+            if ip:
+                run("UPDATE users SET last_login_ip=? WHERE id=?", (ip, rows[0]['id']))
+    except Exception:
+        pass
     return jsonify({'ok': True, 'token': tok, 'user': get_user(rows[0]['id'])})
 
 @app.post('/api/logout')
