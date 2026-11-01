@@ -126,7 +126,11 @@ def db():
     if USE_PG:
         global _pg
         if _pg is None or _pg.closed:
-            _pg = psycopg2.connect(DATABASE_URL)
+            # Bound the wait: a suspended Neon can otherwise leave the
+            # connect hanging for minutes, stalling the whole worker while
+            # the phone has already given up. Fail fast so the caller can
+            # retry against an awake database.
+            _pg = psycopg2.connect(DATABASE_URL, connect_timeout=10)
             _pg.autocommit = False
         return _pg
     con = sqlite3.connect(os.path.join(os.path.dirname(__file__), 'sweetvtu.db'))
@@ -152,8 +156,8 @@ def q(sql, params=()):
     if USE_PG:
         sql = sql.replace('?', '%s')
         for attempt in range(2):
-            cur = db().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             try:
+                cur = db().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
                 cur.execute(sql, params)
                 rows = cur.fetchall()
                 # Commit after reads so the connection never sits idle-in-transaction
@@ -190,8 +194,8 @@ def q(sql, params=()):
 def run(sql, params=()):
     if USE_PG:
         sql = sql.replace('?', '%s')
-        cur = db().cursor()
         try:
+            cur = db().cursor()
             cur.execute(sql, params)
             db().commit()
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
