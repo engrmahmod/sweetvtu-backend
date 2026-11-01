@@ -339,6 +339,7 @@ def init_db():
     # migrate older databases that lack the new columns
     for col, tbl in (("email_verified INTEGER DEFAULT 0", "users"),
                      ("tx_pin_hash TEXT", "users"),
+                     ("username TEXT", "users"),
                      ("monnify_ref TEXT", "users"), ("monnify_acct TEXT", "users"),
                      ("monnify_bank TEXT", "users"), ("monnify_acct_name TEXT", "users"),
                      ("updated_at TEXT", "settings")):
@@ -354,6 +355,11 @@ def init_db():
     # (NULLs are allowed multiple times on both SQLite and Postgres.)
     try:
         run("CREATE UNIQUE INDEX IF NOT EXISTS users_monnify_ref_uniq ON users(monnify_ref)")
+    except Exception:
+        pass
+    # Usernames are unique when set (NULLs for pre-username accounts allowed).
+    try:
+        run("CREATE UNIQUE INDEX IF NOT EXISTS users_username_uniq ON users(username)")
     except Exception:
         pass
     if not q("SELECT v FROM settings WHERE k='margin'"):
@@ -463,7 +469,7 @@ def admin_auth(f):
     return wrapper
 
 def get_user(uid):
-    rows = q("SELECT id,name,phone,email,wallet,email_verified,created,monnify_ref,monnify_acct,monnify_bank,monnify_acct_name FROM users WHERE id=?", (uid,))
+    rows = q("SELECT id,name,username,phone,email,wallet,email_verified,created,monnify_ref,monnify_acct,monnify_bank,monnify_acct_name FROM users WHERE id=?", (uid,))
     return rows[0] if rows else None
 
 # ---------------- email verification ----------------
@@ -865,18 +871,23 @@ def signup():
     d = request.get_json(force=True)
     name, phone, email, pw = (d.get('name') or '').strip(), (d.get('phone') or '').strip(), \
                              (d.get('email') or '').strip(), d.get('password') or ''
+    username = (d.get('username') or '').strip()
     pin = str(d.get('pin') or '').strip()
     if len(name) < 3: return jsonify({'ok': False, 'error': 'Please enter your full name.'}), 400
-    if not re.match(r'^0\d{10}$', phone): return jsonify({'ok': False, 'error': 'Enter a valid 11-digit phone number.'}), 400
+    if not re.match(r'^[A-Za-z0-9_]{3,20}$', username):
+        return jsonify({'ok': False, 'error': 'Choose a username (3–20 letters, numbers or _).'}), 400
     if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email): return jsonify({'ok': False, 'error': 'Enter a valid email address.'}), 400
-    if len(pw) < 8: return jsonify({'ok': False, 'error': 'Password must be at least 8 characters.'}), 400
+    if not re.match(r'^0\d{10}$', phone): return jsonify({'ok': False, 'error': 'Enter a valid 11-digit phone number.'}), 400
     if not re.match(r'^\d{4}$', pin):
         return jsonify({'ok': False, 'error': 'Create a 4-digit transaction PIN.'}), 400
+    if len(pw) < 8: return jsonify({'ok': False, 'error': 'Password must be at least 8 characters.'}), 400
+    if q("SELECT id FROM users WHERE LOWER(username)=LOWER(?)", (username,)):
+        return jsonify({'ok': False, 'error': 'This username is already taken.'}), 400
     if q("SELECT id FROM users WHERE phone=?", (phone,)):
         return jsonify({'ok': False, 'error': 'This number is already registered. Sign in instead.'}), 400
-    run("""INSERT INTO users(name,phone,email,pass_hash,tx_pin_hash,email_verified,wallet,created)
-           VALUES(?,?,?,?,?,0,0,?)""",
-        (name, phone, email, generate_password_hash(pw), generate_password_hash(pin), now_iso()))
+    run("""INSERT INTO users(name,username,phone,email,pass_hash,tx_pin_hash,email_verified,wallet,created)
+           VALUES(?,?,?,?,?,?,0,0,?)""",
+        (name, username, phone, email, generate_password_hash(pw), generate_password_hash(pin), now_iso()))
     uid = q("SELECT id FROM users WHERE phone=?", (phone,))[0]['id']
     user = get_user(uid)
     email_sent = send_verify_code(user)
