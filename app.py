@@ -133,26 +133,54 @@ def db():
     con.row_factory = sqlite3.Row
     return con
 
+def _reset_pg():
+    """Drop the cached Postgres connection so the next db() call reconnects.
+
+    Neon's free compute suspends when idle and kills connections; a killed
+    connection still looks open until used, so without this a worker keeps
+    serving 500s on a dead connection until it is restarted."""
+    global _pg
+    try:
+        if _pg is not None:
+            _pg.close()
+    except Exception:
+        pass
+    _pg = None
+
 def q(sql, params=()):
     """SELECT helper -> list of dicts"""
     if USE_PG:
         sql = sql.replace('?', '%s')
-        cur = db().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        try:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-            # Commit after reads so the connection never sits idle-in-transaction
-            # holding locks (this hung deploys waiting on ALTER TABLE).
-            db().commit()
-        except Exception:
+        for attempt in range(2):
+            cur = db().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             try:
-                db().rollback()
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                # Commit after reads so the connection never sits idle-in-transaction
+                # holding locks (this hung deploys waiting on ALTER TABLE).
+                db().commit()
+                cur.close()
+                return [dict(r) for r in rows]
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                # Connection died (e.g. Neon suspend). Drop it and retry
+                # the read once on a fresh connection.
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+                _reset_pg()
+                if attempt == 1:
+                    raise
             except Exception:
-                pass
-            raise
-        finally:
-            cur.close()
-        return [dict(r) for r in rows]
+                try:
+                    db().rollback()
+                except Exception:
+                    pass
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+                raise
     cur = db().cursor()
     cur.execute(sql, params)
     rows = [dict(r) for r in cur.fetchall()]
@@ -166,6 +194,12 @@ def run(sql, params=()):
         try:
             cur.execute(sql, params)
             db().commit()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            # Connection died (e.g. Neon suspend). Drop it so the next
+            # request gets a fresh one; do NOT retry the write — its
+            # outcome is unknown and retrying could double-apply it.
+            _reset_pg()
+            raise
         except Exception:
             # On Postgres a failed statement aborts the whole transaction;
             # roll back so the connection stays usable for the next statement.
@@ -175,7 +209,10 @@ def run(sql, params=()):
                 pass
             raise
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except Exception:
+                pass
         return
     else:
         con = db()
