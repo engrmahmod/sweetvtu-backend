@@ -678,12 +678,11 @@ def bilal_get(path, params=None):
     return _provider_json(r, 'Bilal')
 
 def bl_phone(phone):
-    """Bilal examples use international format (234...); the frontend sends
-    11-digit 0... numbers, so convert the leading 0 to 234."""
-    phone = re.sub(r'\D', '', phone or '')
-    if phone.startswith('0') and len(phone) == 11:
-        return '234' + phone[1:]
-    return phone
+    """Bilal's live API demands an 11-digit number: its own error reply is
+    'The phone must be 11 digits.' for 13-digit 234... numbers, even though
+    the docs examples show international format. Keep the 11-digit 0...
+    number exactly as the customer typed it."""
+    return re.sub(r'\D', '', phone or '')
 
 def bl_sell_price(plan_id, cost):
     """Sell price for a Bilal plan: admin-set sell price, else cost + margin."""
