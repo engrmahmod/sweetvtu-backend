@@ -11,4 +11,4 @@ services:
       - key: VTPASS_SANDBOX
         value: "1"
       - key: FRONTEND_ORIGIN
-        value: https://engrmahmod.github.io
+        value: https://engrmahmod.github.io,https://pantherdata.com.ng,https://www.pantherdata.com.ng,http://pantherdata.com.ng,http://www.pantherdata.com.ng
