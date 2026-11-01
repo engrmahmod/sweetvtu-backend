@@ -1971,6 +1971,44 @@ def admin_user_pin():
         run("UPDATE users SET tx_pin_hash=? WHERE id=?", (generate_password_hash(pin), uid))
     return jsonify({'ok': True})
 
+@app.post('/api/admin/transaction-resolve')
+@admin_auth
+def admin_transaction_resolve():
+    """Resolve a transaction stuck in 'pending' (e.g. the buy request died
+    after debit, before settle). The admin states the outcome proven from
+    the provider's own record: 'failed' refunds the wallet, 'successful'
+    only marks it. Refuses anything not pending, so settled transactions
+    can never be rewritten through here."""
+    d = request.get_json(force=True, silent=True) or {}
+    ref = (d.get('reference') or '').strip()
+    outcome = (d.get('outcome') or '').strip().lower()
+    if outcome not in ('failed', 'successful'):
+        return jsonify({'ok': False, 'error': "Outcome must be 'failed' or 'successful'."}), 400
+    rows = q("SELECT user_id, amount, status FROM transactions WHERE reference=?", (ref,))
+    if not rows:
+        return jsonify({'ok': False, 'error': 'Transaction not found.'}), 404
+    t = rows[0]
+    if t['status'] != 'pending':
+        return jsonify({'ok': False, 'error': 'Only pending transactions can be resolved.'}), 400
+    note = json.dumps({'admin_resolved': outcome, 'note': 'Resolved by admin from provider record.'})
+    con = db()
+    try:
+        if USE_PG:
+            cur = con.cursor()
+            if outcome == 'failed':
+                cur.execute("UPDATE users SET wallet=wallet+%s WHERE id=%s", (t['amount'], t['user_id']))
+            cur.execute("UPDATE transactions SET status=%s, meta=%s WHERE reference=%s", (outcome, note, ref))
+            con.commit(); cur.close()
+        else:
+            if outcome == 'failed':
+                con.execute("UPDATE users SET wallet=wallet+? WHERE id=?", (t['amount'], t['user_id']))
+            con.execute("UPDATE transactions SET status=?, meta=? WHERE reference=?", (outcome, note, ref))
+            con.commit()
+    finally:
+        if not USE_PG: con.close()
+    bal = q("SELECT wallet FROM users WHERE id=?", (t['user_id'],))
+    return jsonify({'ok': True, 'wallet': float(bal[0]['wallet']) if bal else None})
+
 @app.delete('/api/admin/user')
 @admin_auth
 def admin_user_delete():
