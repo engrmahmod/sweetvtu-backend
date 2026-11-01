@@ -599,19 +599,30 @@ def fatizara_token():
         raise RuntimeError('Fatizara auth failed: ' + str(j.get('status') or j)[:200])
     return tok, j
 
+def _provider_json(r, name):
+    """Parse a provider reply defensively. An empty or non-JSON body (e.g. a
+    gateway error page) must never leak a parser exception string to the
+    customer — it becomes a clean failed reply instead, and buys using it
+    still auto-refund through the normal failed path."""
+    try:
+        return r.json()
+    except ValueError:
+        return {'status': 'failed',
+                'message': f'{name} did not return a readable reply. Please try again.'}
+
 def fatizara_post(path, payload):
     tok, _ = fatizara_token()
     r = requests.post(FATIZARA_BASE + path, json=payload,
                       headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
                       timeout=45)
-    return r.json()
+    return _provider_json(r, 'Fatizara')
 
 def fatizara_get(path, params=None):
     tok, _ = fatizara_token()
     r = requests.get(FATIZARA_BASE + path, params=params,
                      headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
                      timeout=30)
-    return r.json()
+    return _provider_json(r, 'Fatizara')
 
 # ---------------- Bilal Sada Sub ----------------
 # Docs: https://docs.bilalsadasub.com (public).
@@ -652,14 +663,14 @@ def bilal_post(path, payload):
     r = requests.post(BILAL_BASE + path, json=payload,
                       headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
                       timeout=45)
-    return r.json()
+    return _provider_json(r, 'Bilal')
 
 def bilal_get(path, params=None):
     tok, _ = bilal_token()
     r = requests.get(BILAL_BASE + path, params=params,
                      headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
                      timeout=30)
-    return r.json()
+    return _provider_json(r, 'Bilal')
 
 def bl_phone(phone):
     """Bilal examples use international format (234...); the frontend sends
@@ -832,6 +843,17 @@ def config():
                     'email_ready': bool(S('BREVO_API_KEY') or (SMTP_USER and SMTP_APP_PASSWORD)),
                     'monnify_ready': monnify_configured(),
                     'fund_method': 'monnify'})
+
+@app.get('/api/ping')
+def ping():
+    """Keep-warm probe: touches the database with SELECT 1 and nothing else.
+    A scheduled ping every few minutes keeps both Render and the Neon
+    database awake, so shop loads stay fast. No customer data, no auth."""
+    try:
+        q("SELECT 1")
+        return jsonify({'ok': True})
+    except Exception:
+        return jsonify({'ok': False}), 500
 
 @app.post('/api/signup')
 @limiter.limit('5 per minute')
