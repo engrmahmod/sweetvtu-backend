@@ -1,5 +1,5 @@
 """
-Panther Data backend — real VTpass / Fatizara + Paystack integration.
+Panther Data backend — real VTpass / Fatizara / Bilal + Paystack integration.
 Holds API keys server-side (env vars). Never expose them to the frontend.
 
 Env vars:
@@ -42,9 +42,11 @@ SETTINGS_META = {
     'VTPASS_PUBLIC_KEY':  dict(group='VTpass',   label='Public Key',   secret=True),
     'VTPASS_SECRET_KEY':  dict(group='VTpass',   label='Secret Key',   secret=True),
     'VTPASS_SANDBOX':     dict(group='VTpass',   label='Sandbox mode — 1 = test, 0 = LIVE', secret=False),
-    'PROVIDER':           dict(group='Provider', label='Active provider — vtpass or fatizara', secret=False),
+    'PROVIDER':           dict(group='Provider', label='Active provider — vtpass, fatizara or bilal', secret=False),
     'FATIZARA_USERNAME':  dict(group='Fatizara', label='Fatizara username', secret=False),
     'FATIZARA_PASSWORD':  dict(group='Fatizara', label='Fatizara password', secret=True),
+    'BILAL_USERNAME':     dict(group='Bilal',    label='Bilal username', secret=False),
+    'BILAL_PASSWORD':     dict(group='Bilal',    label='Bilal password', secret=True),
     'MONNIFY_API_KEY':    dict(group='Monnify',  label='API Key',      secret=True),
     'MONNIFY_SECRET_KEY': dict(group='Monnify',  label='Secret Key',   secret=True),
     'MONNIFY_CONTRACT_CODE': dict(group='Monnify', label='Contract Code', secret=True),
@@ -73,13 +75,16 @@ def monnify_base():
     return 'https://sandbox.monnify.com' if monnify_sandbox() else 'https://api.monnify.com'
 
 def provider():
-    """Active vending provider: 'vtpass' (default) or 'fatizara'.
-    VTpass stays the default until Fatizara is built and proven with test buys."""
+    """Active vending provider: 'vtpass' (default), 'fatizara' or 'bilal'.
+    VTpass stays the default until the chosen provider is proven with test buys."""
     p = (S('PROVIDER') or 'vtpass').strip().lower()
-    return p if p in ('vtpass', 'fatizara') else 'vtpass'
+    return p if p in ('vtpass', 'fatizara', 'bilal') else 'vtpass'
 
 def fatizara_configured():
     return bool(S('FATIZARA_USERNAME') and S('FATIZARA_PASSWORD'))
+
+def bilal_configured():
+    return bool(S('BILAL_USERNAME') and S('BILAL_PASSWORD'))
 
 LAGOS = timezone(timedelta(hours=1))
 
@@ -281,6 +286,11 @@ def init_db():
              name TEXT, cost REAL, sell REAL, updated TEXT)""",
         """CREATE TABLE IF NOT EXISTS fatizara_discos(
              disco_key TEXT PRIMARY KEY, fatizara_id TEXT, label TEXT, updated TEXT)""",
+        """CREATE TABLE IF NOT EXISTS bilal_plans(
+             plan_id TEXT PRIMARY KEY, service TEXT, network TEXT,
+             name TEXT, cost REAL, sell REAL, updated TEXT)""",
+        """CREATE TABLE IF NOT EXISTS bilal_discos(
+             disco_key TEXT PRIMARY KEY, bilal_id TEXT, label TEXT, updated TEXT)""",
         """CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT, updated_at TEXT)""",
     ]
     for s in stmts:
@@ -326,6 +336,8 @@ def load_settings():
         'PROVIDER': os.environ.get('PROVIDER', 'vtpass'),
         'FATIZARA_USERNAME': os.environ.get('FATIZARA_USERNAME', ''),
         'FATIZARA_PASSWORD': os.environ.get('FATIZARA_PASSWORD', ''),
+        'BILAL_USERNAME': os.environ.get('BILAL_USERNAME', ''),
+        'BILAL_PASSWORD': os.environ.get('BILAL_PASSWORD', ''),
         'MONNIFY_API_KEY': os.environ.get('MONNIFY_API_KEY', '').strip(),
         'MONNIFY_SECRET_KEY': os.environ.get('MONNIFY_SECRET_KEY', '').strip(),
         'MONNIFY_CONTRACT_CODE': os.environ.get('MONNIFY_CONTRACT_CODE', '').strip(),
@@ -560,6 +572,70 @@ def fatizara_get(path, params=None):
                      timeout=30)
     return r.json()
 
+# ---------------- Bilal Sada Sub ----------------
+# Docs: https://docs.bilalsadasub.com (public).
+# Same two-step token flow as Fatizara: POST /api/user with HTTP Basic auth
+# (username:password) returns an AccessToken, then every vending call carries
+# 'Authorization: Token <AccessToken>'. Bilal ALSO documents sandbox keys
+# (sk_test_…) for simulated tests, but the docs never say how a sandbox key
+# is obtained, so only the live path below is wired up; sandbox testing is
+# a question for Bilal support, not a code branch.
+# Bilal purchase responses carry status: 'success' | 'pending' | 'fail'.
+# 'pending' is NOT a failure: the debit stays and the transaction stays
+# pending until requery (GET /api/requery/{request-id}) or the admin
+# transaction-resolve endpoint settles it. Never auto-refund a pending
+# Bilal buy — the money may still deliver.
+BILAL_BASE = 'https://bilalsadasub.com'
+BILAL_NETWORKS = {'mtn': 1, 'airtel': 2, 'glo': 3, 'etisalat': 4}
+BILAL_CABLES = {'gotv': 1, 'dstv': 2, 'startimes': 3}
+# Dashboard disco mapping (2026-11-01): Bilal lists 10 discos; Enugu has no
+# Bilal mapping and stays unmapped under this provider.
+BILAL_DISCO_IDS = {'ikeja-electric': 1, 'eko-electric': 2, 'kano-electric': 3,
+                   'portharcourt-electric': 4, 'jos-electric': 5, 'ibadan-electric': 6,
+                   'kaduna-electric': 7, 'abuja-electric': 8, 'benin-electric': 9,
+                   'yola-electric': 10}
+
+def bilal_token():
+    """Mint an AccessToken. Returns (token, full_auth_response)."""
+    creds = base64.b64encode(f"{S('BILAL_USERNAME')}:{S('BILAL_PASSWORD')}".encode()).decode()
+    r = requests.post(BILAL_BASE + '/api/user',
+                      headers={'Authorization': f'Basic {creds}'}, timeout=30)
+    j = r.json()
+    tok = j.get('AccessToken')
+    if not tok:
+        raise RuntimeError('Bilal auth failed: ' + str(j.get('status') or j)[:200])
+    return tok, j
+
+def bilal_post(path, payload):
+    tok, _ = bilal_token()
+    r = requests.post(BILAL_BASE + path, json=payload,
+                      headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
+                      timeout=45)
+    return r.json()
+
+def bilal_get(path, params=None):
+    tok, _ = bilal_token()
+    r = requests.get(BILAL_BASE + path, params=params,
+                     headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
+                     timeout=30)
+    return r.json()
+
+def bl_phone(phone):
+    """Bilal examples use international format (234...); the frontend sends
+    11-digit 0... numbers, so convert the leading 0 to 234."""
+    phone = re.sub(r'\D', '', phone or '')
+    if phone.startswith('0') and len(phone) == 11:
+        return '234' + phone[1:]
+    return phone
+
+def bl_sell_price(plan_id, cost):
+    """Sell price for a Bilal plan: admin-set sell price, else cost + margin."""
+    rows = q("SELECT sell FROM bilal_plans WHERE plan_id=?", (plan_id,))
+    if rows and rows[0]['sell'] is not None:
+        return float(rows[0]['sell'])
+    margin = float((q("SELECT v FROM settings WHERE k='margin'") or [{'v': '0'}])[0]['v'])
+    return round(float(cost) * (1 + margin / 100), 2)
+
 def fz_sell_price(plan_id, cost):
     """Sell price for a Fatizara plan: admin-set sell price, else cost + margin."""
     rows = q("SELECT sell FROM fatizara_plans WHERE plan_id=?", (plan_id,))
@@ -674,12 +750,43 @@ def debit_and_buy_fatizara(user_id, amount, desc, tx_type, service, endpoint, fz
     err_text = resp.get('message') or resp.get('error') or 'Purchase failed.'
     return _settle_wallet(user_id, ref, amount, ok, provider_ref, token, resp, err_text)
 
+def debit_and_buy_bilal(user_id, amount, desc, tx_type, service, endpoint, bl_payload):
+    """Debit wallet, call Bilal, refund on failure. Same guarantees as
+    debit_and_buy_fatizara, with one Bilal-specific rule: a 'pending' status
+    is neither success nor failure — the debit stays and the transaction
+    stays pending (see bilal-requery / transaction-resolve), because Bilal
+    may still deliver it. Refunding a pending buy could double-spend if
+    Bilal later delivers."""
+    ref, err = _debit_wallet(user_id, amount, desc, tx_type, service)
+    if err:
+        return False, err
+    rid = request_id()
+    bl_payload = dict(bl_payload); bl_payload['request-id'] = rid
+    try:
+        resp = bilal_post(endpoint, bl_payload)
+    except Exception as e:
+        resp = {'status': 'failed', 'message': str(e)}
+    status = (resp.get('status') or '').lower()
+    provider_ref = resp.get('request-id') or resp.get('request_id') or rid
+    token = resp.get('token') or ''
+    if status == 'pending':
+        # Keep the debit, keep the transaction pending, remember the Bilal
+        # request-id as provider_ref so requery can find it later.
+        run("UPDATE transactions SET provider_ref=?, meta=? WHERE reference=?",
+            (provider_ref, json.dumps(resp)[:4000], ref))
+        return False, {'pending': True, 'reference': ref,
+                       'error': 'Purchase is processing at Bilal. It stays pending until confirmed — check back shortly.'}
+    ok = status in ('success', 'successful')
+    err_text = resp.get('message') or resp.get('error') or 'Purchase failed.'
+    return _settle_wallet(user_id, ref, amount, ok, provider_ref, token, resp, err_text)
+
 # ---------------- public ----------------
 @app.get('/api/config')
 def config():
     return jsonify({'ok': True, 'paystack_public_key': S('PAYSTACK_PUBLIC_KEY'),
                     'sandbox': vt_sandbox(), 'live': True,
                     'provider': provider(), 'fatizara_ready': fatizara_configured(),
+                    'bilal_ready': bilal_configured(),
                     'email_via': 'brevo' if S('BREVO_API_KEY') else 'smtp',
                     'email_ready': bool(S('BREVO_API_KEY') or (SMTP_USER and SMTP_APP_PASSWORD)),
                     'monnify_ready': monnify_configured(),
@@ -1192,6 +1299,15 @@ def buy_airtime():
             {'network': FATIZARA_NETWORKS[net], 'phone': phone,
              'plan_type': FATIZARA_AIRTIME_PLAN_TYPE, 'amount': amount, 'bypass': False})
         return jsonify({'ok': ok, **info})
+    if provider() == 'bilal':
+        if not bilal_configured():
+            return jsonify({'ok': False, 'error': 'Bilal is not set up yet.'}), 503
+        ok, info = debit_and_buy_bilal(
+            g.user_id, amount, f'{net.upper()} airtime ₦{amount:,} → {phone}',
+            'airtime', net, '/topup',
+            {'network': BILAL_NETWORKS[net], 'phone': bl_phone(phone),
+             'plan_type': 'VTU', 'amount': amount, 'bypass': False})
+        return jsonify({'ok': ok, **info})
     ok, info = debit_and_buy(g.user_id, amount, f'{net.upper()} airtime ₦{amount:,} → {phone}',
                              'airtime', net,
                              {'serviceID': NETWORKS[net], 'amount': amount, 'phone': phone})
@@ -1209,6 +1325,14 @@ def data_plans():
         plans = [{'variation_code': r['plan_id'], 'name': r['name'],
                   'cost': float(r['cost'] or 0),
                   'price': fz_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
+        return jsonify({'ok': True, 'plans': plans})
+    if provider() == 'bilal':
+        # Same shape again (variation_code = Bilal plan id).
+        rows = q("SELECT plan_id, name, cost FROM bilal_plans "
+                 "WHERE service='data' AND network=? ORDER BY cost", (net,))
+        plans = [{'variation_code': r['plan_id'], 'name': r['name'],
+                  'cost': float(r['cost'] or 0),
+                  'price': bl_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
         return jsonify({'ok': True, 'plans': plans})
     svc = DATA_SVC.get(net, 'mtn-data')
     varis = vt_variations(svc)
@@ -1246,6 +1370,21 @@ def buy_data():
             {'network': FATIZARA_NETWORKS.get(net, 1), 'phone': phone,
              'data_plan': int(code) if code.isdigit() else code, 'bypass': False})
         return jsonify({'ok': ok, **info})
+    if provider() == 'bilal':
+        if not bilal_configured():
+            return jsonify({'ok': False, 'error': 'Bilal is not set up yet.'}), 503
+        rows = q("SELECT plan_id, name, cost FROM bilal_plans "
+                 "WHERE plan_id=? AND service='data' AND network=?", (code, net))
+        if not rows:
+            return jsonify({'ok': False, 'error': 'This plan is no longer available. Refresh plans.'}), 400
+        p = rows[0]
+        cost = float(p['cost'] or 0)
+        price = bl_sell_price(code, cost)
+        ok, info = debit_and_buy_bilal(
+            g.user_id, price, f"{p['name']} → {phone}", 'data', net, '/data',
+            {'network': BILAL_NETWORKS.get(net, 1), 'phone': bl_phone(phone),
+             'data_plan': int(code) if code.isdigit() else code, 'bypass': False})
+        return jsonify({'ok': ok, **info})
     svc = DATA_SVC.get(net, 'mtn-data')
     varis = {v.get('variation_code'): v for v in vt_variations(svc)}
     if code not in varis:
@@ -1269,6 +1408,13 @@ def cable_plans():
                   'cost': float(r['cost'] or 0),
                   'price': fz_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
         return jsonify({'ok': True, 'plans': plans})
+    if provider() == 'bilal':
+        rows = q("SELECT plan_id, name, cost FROM bilal_plans "
+                 "WHERE service='cable' AND network=? ORDER BY cost", (prov,))
+        plans = [{'variation_code': r['plan_id'], 'name': r['name'],
+                  'cost': float(r['cost'] or 0),
+                  'price': bl_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
+        return jsonify({'ok': True, 'plans': plans})
     svc = CABLE_SVC.get(prov, 'dstv')
     varis = vt_variations(svc)
     plans = [{'variation_code': v.get('variation_code'), 'name': v.get('name'),
@@ -1287,6 +1433,30 @@ def verify():
     vtype = (d.get('type') or '').strip()
     if not service_id or len(billers) < 5:
         return jsonify({'ok': False, 'error': 'Enter a valid number.'}), 400
+    if provider() == 'bilal':
+        if not bilal_configured():
+            return jsonify({'ok': False, 'error': 'Bilal is not set up yet.'}), 503
+        try:
+            if service_id in CABLE_SVC and service_id != 'showmax':
+                resp = bilal_get('/cable/cable-validation',
+                                 {'iuc': billers, 'cable': BILAL_CABLES[service_id]})
+                if (resp.get('status') or '').lower() in ('success', 'successful') and resp.get('name'):
+                    return jsonify({'ok': True, 'customer': resp.get('name'), 'raw': resp})
+                return jsonify({'ok': False, 'error': 'Could not verify this number. Check and try again.'}), 400
+            rows = q("SELECT bilal_id FROM bilal_discos WHERE disco_key=?", (service_id,))
+            if rows:
+                bl_disco = rows[0]['bilal_id']
+                resp = bilal_get('/bill/bill-validation',
+                                 {'meter_number': billers,
+                                  'disco': int(bl_disco) if str(bl_disco).isdigit() else bl_disco,
+                                  'meter_type': vtype or 'prepaid'})
+                if (resp.get('status') or '').lower() in ('success', 'successful'):
+                    name = resp.get('customer_name') or resp.get('name') or ''
+                    return jsonify({'ok': True, 'customer': name, 'raw': resp})
+                return jsonify({'ok': False, 'error': 'Could not verify this meter. Check and try again.'}), 400
+        except Exception:
+            return jsonify({'ok': False, 'error': 'Verification service unreachable.'}), 502
+        return jsonify({'ok': False, 'error': 'Verification is not available for this service.'}), 400
     if provider() == 'fatizara':
         if not fatizara_configured():
             return jsonify({'ok': False, 'error': 'Fatizara is not set up yet.'}), 503
@@ -1357,6 +1527,26 @@ def buy_cable():
             {'cable': FATIZARA_CABLES.get(prov, 2), 'iuc': billers,
              'cable_plan': int(raw_plan) if raw_plan.isdigit() else raw_plan, 'bypass': False})
         return jsonify({'ok': ok, **info})
+    if provider() == 'bilal':
+        if not bilal_configured():
+            return jsonify({'ok': False, 'error': 'Bilal is not set up yet.'}), 503
+        rows = q("SELECT plan_id, name, cost FROM bilal_plans "
+                 "WHERE plan_id=? AND service='cable' AND network=?", (code, prov))
+        if not rows:
+            return jsonify({'ok': False, 'error': 'This package is no longer available.'}), 400
+        p = rows[0]
+        cost = float(p['cost'] or 0)
+        price = bl_sell_price(code, cost)
+        # Seeded cable ids carry a 'c:' prefix (same collision guard as
+        # Fatizara); Bilal itself wants the plain numeric plan id.
+        raw_plan = code[2:] if code.startswith('c:') else code
+        ok, info = debit_and_buy_bilal(
+            g.user_id, price, f"{prov.upper()} {p['name']} → {billers}",
+            'cable', prov, '/cable',
+            {'cable': BILAL_CABLES.get(prov, 2),
+             'cable_plan': int(raw_plan) if raw_plan.isdigit() else raw_plan,
+             'iuc': billers, 'bypass': 0})
+        return jsonify({'ok': ok, **info})
     varis = {v.get('variation_code'): v for v in vt_variations(svc)}
     if code not in varis:
         return jsonify({'ok': False, 'error': 'This package is no longer available.'}), 400
@@ -1374,6 +1564,12 @@ def buy_cable():
 def discos():
     if provider() == 'fatizara':
         rows = q("SELECT disco_key, label FROM fatizara_discos ORDER BY label")
+        out = [{'serviceID': r['disco_key'], 'label': r['label'],
+                'types': [{'variation_code': 'prepaid', 'name': 'Prepaid'},
+                          {'variation_code': 'postpaid', 'name': 'Postpaid'}]} for r in rows]
+        return jsonify({'ok': True, 'discos': out})
+    if provider() == 'bilal':
+        rows = q("SELECT disco_key, label FROM bilal_discos ORDER BY label")
         out = [{'serviceID': r['disco_key'], 'label': r['label'],
                 'types': [{'variation_code': 'prepaid', 'name': 'Prepaid'},
                           {'variation_code': 'postpaid', 'name': 'Postpaid'}]} for r in rows]
@@ -1412,6 +1608,20 @@ def buy_power():
             {'disco': int(fz_disco) if str(fz_disco).isdigit() else fz_disco,
              'meter_type': vtype,
              'meter_number': meter, 'amount': amount, 'bypass': False})
+        return jsonify({'ok': ok, **info})
+    if provider() == 'bilal':
+        if not bilal_configured():
+            return jsonify({'ok': False, 'error': 'Bilal is not set up yet.'}), 503
+        rows = q("SELECT bilal_id FROM bilal_discos WHERE disco_key=?", (svc,))
+        if not rows:
+            return jsonify({'ok': False, 'error': 'This disco is not mapped yet.'}), 400
+        bl_disco = rows[0]['bilal_id']
+        ok, info = debit_and_buy_bilal(
+            g.user_id, amount, f'Electricity ₦{amount:,} ({vtype}) → {meter}',
+            'power', svc, '/bill',
+            {'disco': int(bl_disco) if str(bl_disco).isdigit() else bl_disco,
+             'meter_type': vtype,
+             'meter_number': meter, 'amount': amount})
         return jsonify({'ok': ok, **info})
     ok, info = debit_and_buy(g.user_id, amount, f'Electricity ₦{amount:,} ({vtype}) → {meter}',
                              'power', svc,
@@ -1696,6 +1906,200 @@ def fatizara_seed_plans():
     return jsonify({'ok': True, 'plans': n_plans, 'discos': n_discos,
                     'note': 'Sell prices start at Fatizara cost — set retail prices in the admin panel before switching customers over.'})
 
+@app.get('/api/admin/bilal-balance')
+@admin_auth
+def bilal_balance():
+    """Bilal wallet balance comes from the /api/user auth response."""
+    if not bilal_configured():
+        return jsonify({'ok': False, 'error': 'Bilal username / password missing.'}), 502
+    try:
+        _, auth_resp = bilal_token()
+        bal = auth_resp.get('balance')
+        try: bal = float(str(bal).replace(',', ''))
+        except (TypeError, ValueError): bal = None
+        if bal is None:
+            return jsonify({'ok': False, 'error': 'Could not read balance.'}), 502
+        return jsonify({'ok': True, 'balance': bal})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 502
+
+@app.get('/api/admin/bilal-plans')
+@admin_auth
+def bilal_plans_admin():
+    return jsonify({'ok': True, 'plans': q("SELECT * FROM bilal_plans ORDER BY service, network, cost")})
+
+@app.post('/api/admin/bilal-plan')
+@admin_auth
+def bilal_plan_save():
+    d = request.get_json(force=True, silent=True) or {}
+    plan_id = (d.get('plan_id') or '').strip()
+    service = (d.get('service') or '').strip()
+    network = (d.get('network') or '').strip()
+    name = (d.get('name') or '').strip()
+    if not plan_id or service not in ('data', 'cable') or not name:
+        return jsonify({'ok': False, 'error': 'plan_id, service (data/cable) and name are required.'}), 400
+    try: cost = float(d.get('cost'))
+    except Exception: return jsonify({'ok': False, 'error': 'Enter a valid cost.'}), 400
+    sell = d.get('sell')
+    try: sell = None if sell in (None, '') else float(sell)
+    except Exception: return jsonify({'ok': False, 'error': 'Enter a valid sell price.'}), 400
+    run("""INSERT INTO bilal_plans(plan_id,service,network,name,cost,sell,updated)
+           VALUES(?,?,?,?,?,?,?)
+           ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
+           network=excluded.network, name=excluded.name, cost=excluded.cost,
+           sell=excluded.sell, updated=excluded.updated""",
+        (plan_id, service, network, name, cost, sell, now_iso()))
+    return jsonify({'ok': True})
+
+@app.get('/api/admin/bilal-discos')
+@admin_auth
+def bilal_discos_admin():
+    return jsonify({'ok': True, 'discos': q("SELECT * FROM bilal_discos ORDER BY label")})
+
+@app.post('/api/admin/bilal-disco')
+@admin_auth
+def bilal_disco_save():
+    d = request.get_json(force=True, silent=True) or {}
+    disco_key = (d.get('disco_key') or '').strip()
+    bl_id = (d.get('bilal_id') or '').strip()
+    label = (d.get('label') or '').strip()
+    if not disco_key or not bl_id or not label:
+        return jsonify({'ok': False, 'error': 'disco_key, bilal_id and label are required.'}), 400
+    run("""INSERT INTO bilal_discos(disco_key,bilal_id,label,updated)
+           VALUES(?,?,?,?)
+           ON CONFLICT(disco_key) DO UPDATE SET bilal_id=excluded.bilal_id,
+           label=excluded.label, updated=excluded.updated""",
+        (disco_key, bl_id, label, now_iso()))
+    return jsonify({'ok': True})
+
+@app.get('/api/admin/bilal-cost-check')
+@admin_auth
+def bilal_cost_check():
+    """Plans whose sell price sits below Bilal cost — same idea as cost-check."""
+    out = []
+    for r in q("SELECT plan_id, service, network, name, cost, sell FROM bilal_plans"):
+        cost = float(r['cost'] or 0)
+        sell = bl_sell_price(r['plan_id'], cost)
+        if sell < cost:
+            out.append({'plan': r['name'], 'code': r['plan_id'], 'service': r['service'],
+                        'cost': cost, 'sell': sell, 'loss': round(cost - sell, 2)})
+    return jsonify({'ok': True, 'losing': out})
+
+# Seed: the dashboard disco mapping is known, but data/cable plan ids only
+# come from the live catalog (the dashboard tables show names + prices, not
+# ids), so the live pull below is the real seed. Safe to re-run: updates
+# cost/name, never overwrites an admin-set sell price.
+BILAL_DISCO_SEED = [
+    ('ikeja-electric', 1, 'Ikeja Electric (IKEDC)'),
+    ('eko-electric', 2, 'Eko Electric (EKEDC)'),
+    ('kano-electric', 3, 'Kano Electric (KEDCO)'),
+    ('portharcourt-electric', 4, 'PH Electric (PHEDC)'),
+    ('jos-electric', 5, 'Jos Electric (JEDC)'),
+    ('ibadan-electric', 6, 'Ibadan Electric (IBEDC)'),
+    ('kaduna-electric', 7, 'Kaduna Electric (KAEDC)'),
+    ('abuja-electric', 8, 'Abuja Electric (AEDC)'),
+    ('benin-electric', 9, 'Benin Electric (BEDC)'),
+    ('yola-electric', 10, 'Yola Electric (YEDC)'),
+]
+BILAL_CATALOG_NETWORKS = {'MTN': 'mtn', 'AIRTEL': 'airtel', 'GLO': 'glo',
+                          '9MOBILE': 'etisalat', 'T2': 'etisalat'}
+BILAL_CATALOG_CABLES = {'DSTV': 'dstv', 'GOTV': 'gotv', 'STARTIMES': 'startimes'}
+
+@app.post('/api/admin/bilal-seed-plans')
+@admin_auth
+def bilal_seed_plans():
+    """Seed Bilal discos from the dashboard mapping, then — if Bilal
+    credentials are set — pull the live catalogs (data + cable plans at
+    this account's tier price, discos) and upsert them."""
+    n_discos = 0
+    for disco_key, bl_id, label in BILAL_DISCO_SEED:
+        run("""INSERT INTO bilal_discos(disco_key,bilal_id,label,updated)
+               VALUES(?,?,?,?)
+               ON CONFLICT(disco_key) DO UPDATE SET bilal_id=excluded.bilal_id,
+               label=excluded.label, updated=excluded.updated""",
+            (disco_key, str(bl_id), label, now_iso()))
+        n_discos += 1
+    n_plans = 0
+    if bilal_configured():
+        try:
+            data = bilal_get('/v1/plans/data')
+            for p in data.get('data') or []:
+                net = BILAL_CATALOG_NETWORKS.get((p.get('network') or '').upper())
+                if not net:
+                    continue
+                name = f"{p.get('plan_name')} {p.get('plan_type')} {p.get('plan_day')}".strip()
+                run("""INSERT INTO bilal_plans(plan_id,service,network,name,cost,updated)
+                       VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
+                       network=excluded.network, name=excluded.name, cost=excluded.cost,
+                       updated=excluded.updated""",
+                    (str(p.get('plan_id')), 'data', net, name, float(p.get('amount') or 0), now_iso()))
+                n_plans += 1
+        except Exception:
+            pass
+        try:
+            cable = bilal_get('/v1/plans/cable')
+            for p in cable.get('data') or []:
+                net = BILAL_CATALOG_CABLES.get((p.get('cable_name') or '').upper())
+                if not net:
+                    continue
+                run("""INSERT INTO bilal_plans(plan_id,service,network,name,cost,updated)
+                       VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
+                       network=excluded.network, name=excluded.name, cost=excluded.cost,
+                       updated=excluded.updated""",
+                    ('c:' + str(p.get('plan_id')), 'cable', net, p.get('plan_name'),
+                     float(p.get('plan_price') or 0), now_iso()))
+                n_plans += 1
+        except Exception:
+            pass
+        try:
+            discos = bilal_get('/v1/plans/discos')
+            for d in discos.get('data') or []:
+                # Only refresh labels for discos already mapped; the catalog
+                # gives no frontend key, so it cannot invent new mappings.
+                run("UPDATE bilal_discos SET label=? WHERE bilal_id=?",
+                    (d.get('disco_name'), str(d.get('plan_id'))))
+        except Exception:
+            pass
+    synced = n_plans > 0
+    return jsonify({'ok': True, 'plans': n_plans, 'discos': n_discos,
+                    'catalog_synced': synced,
+                    'note': ('Live catalog pulled.' if synced else
+                             'Discos seeded. Add Bilal credentials, then re-run to pull live plans.') +
+                    ' Sell prices start at Bilal cost — set retail prices in the admin panel before switching customers over.'})
+
+@app.get('/api/admin/bilal-requery')
+@admin_auth
+def bilal_requery():
+    """Resolve a pending Bilal transaction via GET /api/requery/{request-id}.
+    Only applies to transactions still pending: success marks it successful,
+    failed refunds it through the same settle path as a failed buy."""
+    ref = (request.args.get('reference') or '').strip()
+    rows = q("SELECT user_id, amount, status, provider_ref FROM transactions WHERE reference=?", (ref,))
+    if not rows:
+        return jsonify({'ok': False, 'error': 'Transaction not found.'}), 404
+    tx = rows[0]
+    if tx['status'] != 'pending':
+        return jsonify({'ok': False, 'error': f"Transaction is already {tx['status']}."}), 400
+    rid = tx['provider_ref'] or ''
+    if not rid:
+        return jsonify({'ok': False, 'error': 'No Bilal request-id stored for this transaction.'}), 400
+    try:
+        resp = bilal_get('/requery/' + rid)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 502
+    data = resp.get('data') or {}
+    tstatus = (data.get('transaction_status') or resp.get('status') or '').lower()
+    if tstatus == 'success':
+        run("UPDATE transactions SET status='successful', meta=? WHERE reference=?",
+            (json.dumps(resp)[:4000], ref))
+        return jsonify({'ok': True, 'status': 'successful'})
+    if tstatus in ('failed', 'fail'):
+        _settle_wallet(tx['user_id'], ref, float(tx['amount']), False, rid, '', resp, 'Bilal reports failed.')
+        return jsonify({'ok': True, 'status': 'failed', 'refunded': True})
+    return jsonify({'ok': True, 'status': tstatus or 'pending'})
+
 @app.get('/api/admin/users')
 @admin_auth
 def admin_users():
@@ -1813,8 +2217,8 @@ def admin_settings_save():
     value = '' if value is None else str(value)
     if key.endswith('_SANDBOX') and value not in ('0', '1'):
         return jsonify({'ok': False, 'error': 'Sandbox must be 0 or 1.'}), 400
-    if key == 'PROVIDER' and value not in ('vtpass', 'fatizara'):
-        return jsonify({'ok': False, 'error': 'Provider must be vtpass or fatizara.'}), 400
+    if key == 'PROVIDER' and value not in ('vtpass', 'fatizara', 'bilal'):
+        return jsonify({'ok': False, 'error': 'Provider must be vtpass, fatizara or bilal.'}), 400
     run("""INSERT INTO settings(k,v,updated_at) VALUES(?,?,?)
            ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at""",
         (key, value, now_iso()))
@@ -1842,6 +2246,14 @@ def admin_test_connection():
                 return jsonify({'ok': False, 'detail': 'Fatizara username / password missing.'})
             try:
                 _, auth_resp = fatizara_token()
+                return jsonify({'ok': True, 'detail': f"Auth OK — wallet balance ₦{auth_resp.get('balance')}."})
+            except Exception as e:
+                return jsonify({'ok': False, 'detail': 'Auth failed: ' + str(e)[:120]})
+        if service == 'bilal':
+            if not bilal_configured():
+                return jsonify({'ok': False, 'detail': 'Bilal username / password missing.'})
+            try:
+                _, auth_resp = bilal_token()
                 return jsonify({'ok': True, 'detail': f"Auth OK — wallet balance ₦{auth_resp.get('balance')}."})
             except Exception as e:
                 return jsonify({'ok': False, 'detail': 'Auth failed: ' + str(e)[:120]})
