@@ -1948,6 +1948,29 @@ def admin_user_password():
     run("DELETE FROM tokens WHERE user_id=?", (uid,))
     return jsonify({'ok': True})
 
+@app.post('/api/admin/user-pin')
+@admin_auth
+def admin_user_pin():
+    """Admin sets a user's 4-digit transaction PIN (forgotten / never set).
+    Also clears any PIN lockout from wrong attempts. Sessions are NOT
+    invalidated: a PIN reset is not a credential compromise, unlike a
+    password reset. The admin types the new PIN in the admin page; it is
+    never sent through chat."""
+    d = request.get_json(force=True, silent=True) or {}
+    try: uid = int(d.get('user_id') or 0)
+    except Exception: uid = 0
+    pin = str(d.get('new_pin') or '').strip()
+    if not re.match(r'^\d{4}$', pin):
+        return jsonify({'ok': False, 'error': 'PIN must be 4 digits.'}), 400
+    if not q("SELECT id FROM users WHERE id=?", (uid,)):
+        return jsonify({'ok': False, 'error': 'User not found.'}), 404
+    if NEW_COLS_READY:
+        run("UPDATE users SET tx_pin_hash=?, pin_fails=0, pin_locked_until=NULL WHERE id=?",
+            (generate_password_hash(pin), uid))
+    else:
+        run("UPDATE users SET tx_pin_hash=? WHERE id=?", (generate_password_hash(pin), uid))
+    return jsonify({'ok': True})
+
 @app.delete('/api/admin/user')
 @admin_auth
 def admin_user_delete():
