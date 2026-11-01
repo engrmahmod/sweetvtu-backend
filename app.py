@@ -1,5 +1,5 @@
 """
-SWEETVTU backend — real VTpass + Paystack integration.
+Panther Data backend — real VTpass + Paystack integration.
 Holds API keys server-side (env vars). Never expose them to the frontend.
 
 Env vars:
@@ -8,7 +8,7 @@ Env vars:
   FRONTEND_ORIGIN       (comma-separated allowed origins, default *)
   SMTP_USER             (Gmail address used to send verification codes, e.g. sweetvtu@gmail.com)
   SMTP_APP_PASSWORD     (Gmail *app password*, not the login password)
-  SMTP_FROM_NAME        (sender name shown on emails, default SWEETVTU)
+  SMTP_FROM_NAME        (sender name shown on emails, default Panther Data)
 Provider keys (VTPASS_*, MONNIFY_*, BREVO_*, PAYSTACK_*) are seeded from env
 into the settings table at startup, then editable from the admin panel.
   PORT
@@ -29,7 +29,7 @@ DATABASE_URL    = os.environ.get('DATABASE_URL', '')
 FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', '*')
 SMTP_USER         = os.environ.get('SMTP_USER', '')
 SMTP_APP_PASSWORD = os.environ.get('SMTP_APP_PASSWORD', '')
-SMTP_FROM_NAME    = os.environ.get('SMTP_FROM_NAME', 'SWEETVTU')
+SMTP_FROM_NAME    = os.environ.get('SMTP_FROM_NAME', 'Panther Data')
 # MONNIFY_BVN stays env-only (rarely changed, not admin-editable)
 MONNIFY_BVN        = os.environ.get('MONNIFY_BVN', '').strip()
 
@@ -440,10 +440,10 @@ def new_email_code(user_id, purpose='verify'):
 def send_verify_code(user):
     code = new_email_code(user['id'], 'verify')
     ok = send_email(
-        user['email'], 'Your SWEETVTU verification code',
-        f"Hello {user['name']},\n\nWelcome to SWEETVTU! Your email verification code is:\n\n"
+        user['email'], 'Your Panther Data verification code',
+        f"Hello {user['name']},\n\nWelcome to Panther Data! Your email verification code is:\n\n"
         f"{code}\n\nEnter this code in the app to activate your account. "
-        f"It expires in 15 minutes.\n\nIf you did not sign up, ignore this email.\n\n— SWEETVTU")
+        f"It expires in 15 minutes.\n\nIf you did not sign up, ignore this email.\n\n— Panther Data")
     return ok
 
 def pin_required(f):
@@ -683,9 +683,9 @@ def login():
                 # Send in background so login stays fast.
                 _em, _nm = rows[0]['email'], rows[0].get('name') or 'there'
                 threading.Thread(target=send_email, args=(_em,
-                           'New sign-in to your SWEETVTU account',
+                           'New sign-in to your Panther Data account',
                            f"Hi {_nm},\n\n"
-                           f"We noticed a new sign-in to your SWEETVTU account on {now_iso()} "
+                           f"We noticed a new sign-in to your Panther Data account on {now_iso()} "
                            f"from IP address {ip}.\n\n"
                            f"If this was you, no action is needed. If you don't recognize this "
                            f"sign-in, change your password immediately and contact support."),
@@ -830,7 +830,7 @@ def fund_account():
             f'{monnify_base()}/api/v2/bank-transfer/reserved-accounts',
             headers={'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'},
             json={'accountReference': ref,
-                  'accountName': (user.get('name') or 'SWEETVTU Customer')[:40],
+                  'accountName': (user.get('name') or 'Panther Data Customer')[:40],
                   'currencyCode': 'NGN',
                   'contractCode': S('MONNIFY_CONTRACT_CODE'),
                   'customerEmail': user.get('email'),
@@ -1462,10 +1462,10 @@ def forgot_password():
     if rows:
         user = rows[0]
         code = new_email_code(user['id'], 'reset')
-        send_email(user['email'], 'Reset your SWEETVTU password',
+        send_email(user['email'], 'Reset your Panther Data password',
                    f"Hello {user['name']},\n\nYour password reset code is:\n\n{code}\n\n"
                    f"Enter it in the app with your new password. It expires in 15 minutes.\n\n"
-                   f"If you did not request this, ignore this email.\n\n— SWEETVTU")
+                   f"If you did not request this, ignore this email.\n\n— Panther Data")
     # always ok — never reveal whether the email is registered
     return jsonify({'ok': True})
 
@@ -1543,7 +1543,7 @@ def admin_user_delete():
 
 @app.get('/')
 def index():
-    return jsonify({'ok': True, 'service': 'SWEETVTU backend', 'sandbox': vt_sandbox()})
+    return jsonify({'ok': True, 'service': 'Panther Data backend', 'sandbox': vt_sandbox()})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
