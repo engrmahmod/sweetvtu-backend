@@ -1,5 +1,5 @@
 """
-Panther Data backend — real VTpass + Paystack integration.
+Panther Data backend — real VTpass / Fatizara + Paystack integration.
 Holds API keys server-side (env vars). Never expose them to the frontend.
 
 Env vars:
@@ -42,6 +42,9 @@ SETTINGS_META = {
     'VTPASS_PUBLIC_KEY':  dict(group='VTpass',   label='Public Key',   secret=True),
     'VTPASS_SECRET_KEY':  dict(group='VTpass',   label='Secret Key',   secret=True),
     'VTPASS_SANDBOX':     dict(group='VTpass',   label='Sandbox mode — 1 = test, 0 = LIVE', secret=False),
+    'PROVIDER':           dict(group='Provider', label='Active provider — vtpass or fatizara', secret=False),
+    'FATIZARA_USERNAME':  dict(group='Fatizara', label='Fatizara username', secret=False),
+    'FATIZARA_PASSWORD':  dict(group='Fatizara', label='Fatizara password', secret=True),
     'MONNIFY_API_KEY':    dict(group='Monnify',  label='API Key',      secret=True),
     'MONNIFY_SECRET_KEY': dict(group='Monnify',  label='Secret Key',   secret=True),
     'MONNIFY_CONTRACT_CODE': dict(group='Monnify', label='Contract Code', secret=True),
@@ -68,6 +71,15 @@ def monnify_sandbox():
 
 def monnify_base():
     return 'https://sandbox.monnify.com' if monnify_sandbox() else 'https://api.monnify.com'
+
+def provider():
+    """Active vending provider: 'vtpass' (default) or 'fatizara'.
+    VTpass stays the default until Fatizara is built and proven with test buys."""
+    p = (S('PROVIDER') or 'vtpass').strip().lower()
+    return p if p in ('vtpass', 'fatizara') else 'vtpass'
+
+def fatizara_configured():
+    return bool(S('FATIZARA_USERNAME') and S('FATIZARA_PASSWORD'))
 
 LAGOS = timezone(timedelta(hours=1))
 
@@ -264,6 +276,11 @@ def init_db():
         """CREATE TABLE IF NOT EXISTS plan_prices(
              variation_code TEXT PRIMARY KEY, sell_price REAL, cost_price REAL,
              label TEXT, updated TEXT)""",
+        """CREATE TABLE IF NOT EXISTS fatizara_plans(
+             plan_id TEXT PRIMARY KEY, service TEXT, network TEXT,
+             name TEXT, cost REAL, sell REAL, updated TEXT)""",
+        """CREATE TABLE IF NOT EXISTS fatizara_discos(
+             disco_key TEXT PRIMARY KEY, fatizara_id TEXT, label TEXT, updated TEXT)""",
         """CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT, updated_at TEXT)""",
     ]
     for s in stmts:
@@ -306,6 +323,9 @@ def load_settings():
         'VTPASS_PUBLIC_KEY': os.environ.get('VTPASS_PUBLIC_KEY', ''),
         'VTPASS_SECRET_KEY': os.environ.get('VTPASS_SECRET_KEY', ''),
         'VTPASS_SANDBOX': os.environ.get('VTPASS_SANDBOX', '1'),
+        'PROVIDER': os.environ.get('PROVIDER', 'vtpass'),
+        'FATIZARA_USERNAME': os.environ.get('FATIZARA_USERNAME', ''),
+        'FATIZARA_PASSWORD': os.environ.get('FATIZARA_PASSWORD', ''),
         'MONNIFY_API_KEY': os.environ.get('MONNIFY_API_KEY', '').strip(),
         'MONNIFY_SECRET_KEY': os.environ.get('MONNIFY_SECRET_KEY', '').strip(),
         'MONNIFY_CONTRACT_CODE': os.environ.get('MONNIFY_CONTRACT_CODE', '').strip(),
@@ -497,6 +517,57 @@ def vt_variations(service_id):
     except Exception:
         return []
 
+# ---------------- Fatizara client ----------------
+# Docs: https://app.fatizaradata.com/documentation (login-walled).
+# Auth is a two-step token flow, NOT a static API key: POST /api/user with
+# HTTP Basic auth (username:password) returns an AccessToken, then every
+# vending call carries 'Authorization: Token <AccessToken>'.
+# Fatizara publishes NO token lifetime and NO sandbox — every call is live
+# and debits the real wallet. So a fresh token is minted per operation:
+# one extra cheap call, zero stale-token failures on real-money purchases.
+FATIZARA_BASE = 'https://fatizaradata.com/api'
+FATIZARA_NETWORKS = {'mtn': 1, 'airtel': 2, 'glo': 3, 'etisalat': 4}
+FATIZARA_CABLES = {'gotv': 1, 'dstv': 2, 'startimes': 3}
+# Filled from the docs extraction before go-live (never ships as '' — the
+# provider defaults to vtpass, so the Fatizara path cannot run until set).
+# plan_type: the docs show only 'VTU' for airtime. Meter verify: the docs
+# give GET /api/bill/bill-validation?meter_number&disco&meter_type.
+FATIZARA_AIRTIME_PLAN_TYPE = 'VTU'
+FATIZARA_METER_VERIFY_PATH = '/bill/bill-validation'
+
+def fatizara_token():
+    """Mint an AccessToken. Returns (token, full_auth_response)."""
+    creds = base64.b64encode(f"{S('FATIZARA_USERNAME')}:{S('FATIZARA_PASSWORD')}".encode()).decode()
+    r = requests.post(FATIZARA_BASE + '/user',
+                      headers={'Authorization': f'Basic {creds}'}, timeout=30)
+    j = r.json()
+    tok = j.get('AccessToken')
+    if not tok:
+        raise RuntimeError('Fatizara auth failed: ' + str(j.get('status') or j)[:200])
+    return tok, j
+
+def fatizara_post(path, payload):
+    tok, _ = fatizara_token()
+    r = requests.post(FATIZARA_BASE + path, json=payload,
+                      headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
+                      timeout=45)
+    return r.json()
+
+def fatizara_get(path, params=None):
+    tok, _ = fatizara_token()
+    r = requests.get(FATIZARA_BASE + path, params=params,
+                     headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
+                     timeout=30)
+    return r.json()
+
+def fz_sell_price(plan_id, cost):
+    """Sell price for a Fatizara plan: admin-set sell price, else cost + margin."""
+    rows = q("SELECT sell FROM fatizara_plans WHERE plan_id=?", (plan_id,))
+    if rows and rows[0]['sell'] is not None:
+        return float(rows[0]['sell'])
+    margin = float((q("SELECT v FROM settings WHERE k='margin'") or [{'v': '0'}])[0]['v'])
+    return round(float(cost) * (1 + margin / 100), 2)
+
 def sell_price(variation_code, cost):
     rows = q("SELECT sell_price FROM plan_prices WHERE variation_code=?", (variation_code,))
     if rows and rows[0]['sell_price'] is not None:
@@ -504,8 +575,10 @@ def sell_price(variation_code, cost):
     margin = float((q("SELECT v FROM settings WHERE k='margin'") or [{'v': '0'}])[0]['v'])
     return round(float(cost) * (1 + margin / 100), 2)
 
-def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload):
-    """Debit wallet, call VTpass, refund on failure. Returns (ok, info)."""
+def _debit_wallet(user_id, amount, desc, tx_type, service):
+    """Insert a pending 'out' transaction and debit the wallet atomically.
+    Returns (ref, None) on success, (None, error_info) on insufficient funds.
+    Shared by the VTpass and Fatizara buy paths so both refund identically."""
     ref = 'SV' + secrets.token_hex(5).upper()
     con = db()
     try:
@@ -519,7 +592,7 @@ def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload):
         if bal < amount:
             if not USE_PG: con.execute("ROLLBACK")
             else: con.rollback()
-            return False, {'error': 'Insufficient wallet balance. Please fund your wallet.'}
+            return None, {'error': 'Insufficient wallet balance. Please fund your wallet.'}
         ts = now_iso()
         if USE_PG:
             cur = con.cursor()
@@ -536,7 +609,38 @@ def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload):
             con.commit()
     finally:
         if not USE_PG: con.close()
-    # call VTpass
+    return ref, None
+
+def _settle_wallet(user_id, ref, amount, ok, provider_ref, token, raw, err_text):
+    """Mark the pending transaction successful, or refund + mark failed.
+    Returns (ok, info) in the same shape as the old debit_and_buy."""
+    if ok:
+        run("UPDATE transactions SET status='successful', provider_ref=?, meta=? WHERE reference=?",
+            (provider_ref, json.dumps({'token': token, 'raw': raw})[:4000], ref))
+        return True, {'reference': ref, 'provider_ref': provider_ref, 'token': token}
+    # failure -> refund
+    con = db()
+    try:
+        if USE_PG:
+            cur = con.cursor()
+            cur.execute("UPDATE users SET wallet=wallet+%s WHERE id=%s", (amount, user_id))
+            cur.execute("UPDATE transactions SET status='failed', provider_ref=%s, meta=%s WHERE reference=%s",
+                        (provider_ref, json.dumps(raw)[:4000], ref))
+            con.commit(); cur.close()
+        else:
+            con.execute("UPDATE users SET wallet=wallet+? WHERE id=?", (amount, user_id))
+            con.execute("UPDATE transactions SET status='failed', provider_ref=?, meta=? WHERE reference=?",
+                        (provider_ref, json.dumps(raw)[:4000], ref))
+            con.commit()
+    finally:
+        if not USE_PG: con.close()
+    return False, {'error': str(err_text)[:300], 'reference': ref}
+
+def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload):
+    """Debit wallet, call VTpass, refund on failure. Returns (ok, info)."""
+    ref, err = _debit_wallet(user_id, amount, desc, tx_type, service)
+    if err:
+        return False, err
     vt_payload = dict(vt_payload); vt_payload['request_id'] = request_id()
     try:
         resp = vt_post('/pay', vt_payload)
@@ -548,34 +652,34 @@ def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload):
     txns = content.get('transactions') or {}
     provider_ref = txns.get('transactionId') or content.get('transactionId') or ''
     token = (txns.get('token') or content.get('token') or '')
-    if ok:
-        run("UPDATE transactions SET status='successful', provider_ref=?, meta=? WHERE reference=?",
-            (provider_ref, json.dumps({'token': token, 'raw': resp})[:4000], ref))
-        return True, {'reference': ref, 'provider_ref': provider_ref, 'token': token}
-    # failure -> refund
-    con = db()
+    err_text = ((content.get('errors') or '') if isinstance(content, dict) else '') or resp.get('response_description') or 'Purchase failed.'
+    return _settle_wallet(user_id, ref, amount, ok, provider_ref, token, resp, err_text)
+
+def debit_and_buy_fatizara(user_id, amount, desc, tx_type, service, endpoint, fz_payload):
+    """Debit wallet, call Fatizara, refund on failure. Same guarantees as
+    debit_and_buy: a lost/failed provider reply can never double-charge.
+    Fatizara has no sandbox, so this path only runs once the provider switch
+    is on AND the Fatizara wallet is funded — every call is live."""
+    ref, err = _debit_wallet(user_id, amount, desc, tx_type, service)
+    if err:
+        return False, err
+    fz_payload = dict(fz_payload); fz_payload['request-id'] = request_id()
     try:
-        if USE_PG:
-            cur = con.cursor()
-            cur.execute("UPDATE users SET wallet=wallet+%s WHERE id=%s", (amount, user_id))
-            cur.execute("UPDATE transactions SET status='failed', provider_ref=%s, meta=%s WHERE reference=%s",
-                        (provider_ref, json.dumps(resp)[:4000], ref))
-            con.commit(); cur.close()
-        else:
-            con.execute("UPDATE users SET wallet=wallet+? WHERE id=?", (amount, user_id))
-            con.execute("UPDATE transactions SET status='failed', provider_ref=?, meta=? WHERE reference=?",
-                        (provider_ref, json.dumps(resp)[:4000], ref))
-            con.commit()
-    finally:
-        if not USE_PG: con.close()
-    err = ((content.get('errors') or '') if isinstance(content, dict) else '') or resp.get('response_description') or 'Purchase failed.'
-    return False, {'error': str(err)[:300], 'reference': ref}
+        resp = fatizara_post(endpoint, fz_payload)
+    except Exception as e:
+        resp = {'status': 'failed', 'message': str(e)}
+    ok = (resp.get('status') or '').lower() in ('success', 'successful')
+    provider_ref = resp.get('request-id') or resp.get('request_id') or ''
+    token = resp.get('token') or ''
+    err_text = resp.get('message') or resp.get('error') or 'Purchase failed.'
+    return _settle_wallet(user_id, ref, amount, ok, provider_ref, token, resp, err_text)
 
 # ---------------- public ----------------
 @app.get('/api/config')
 def config():
     return jsonify({'ok': True, 'paystack_public_key': S('PAYSTACK_PUBLIC_KEY'),
                     'sandbox': vt_sandbox(), 'live': True,
+                    'provider': provider(), 'fatizara_ready': fatizara_configured(),
                     'email_via': 'brevo' if S('BREVO_API_KEY') else 'smtp',
                     'email_ready': bool(S('BREVO_API_KEY') or (SMTP_USER and SMTP_APP_PASSWORD)),
                     'monnify_ready': monnify_configured(),
@@ -1079,6 +1183,15 @@ def buy_airtime():
     if net not in NETWORKS: return jsonify({'ok': False, 'error': 'Choose a network.'}), 400
     if not re.match(r'^0\d{10}$', phone): return jsonify({'ok': False, 'error': 'Enter a valid 11-digit phone number.'}), 400
     if amount < 50: return jsonify({'ok': False, 'error': 'Minimum airtime is ₦50.'}), 400
+    if provider() == 'fatizara':
+        if not fatizara_configured():
+            return jsonify({'ok': False, 'error': 'Fatizara is not set up yet.'}), 503
+        ok, info = debit_and_buy_fatizara(
+            g.user_id, amount, f'{net.upper()} airtime ₦{amount:,} → {phone}',
+            'airtime', net, '/topup/',
+            {'network': FATIZARA_NETWORKS[net], 'phone': phone,
+             'plan_type': FATIZARA_AIRTIME_PLAN_TYPE, 'amount': amount, 'bypass': False})
+        return jsonify({'ok': ok, **info})
     ok, info = debit_and_buy(g.user_id, amount, f'{net.upper()} airtime ₦{amount:,} → {phone}',
                              'airtime', net,
                              {'serviceID': NETWORKS[net], 'amount': amount, 'phone': phone})
@@ -1088,6 +1201,15 @@ def buy_airtime():
 @auth
 def data_plans():
     net = (request.args.get('network') or 'mtn').lower()
+    if provider() == 'fatizara':
+        # Same response shape as VTpass (variation_code = Fatizara plan id),
+        # so the existing frontend works unchanged after the provider switch.
+        rows = q("SELECT plan_id, name, cost FROM fatizara_plans "
+                 "WHERE service='data' AND network=? ORDER BY cost", (net,))
+        plans = [{'variation_code': r['plan_id'], 'name': r['name'],
+                  'cost': float(r['cost'] or 0),
+                  'price': fz_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
+        return jsonify({'ok': True, 'plans': plans})
     svc = DATA_SVC.get(net, 'mtn-data')
     varis = vt_variations(svc)
     plans = []
@@ -1109,6 +1231,21 @@ def buy_data():
     code = (d.get('variation_code') or '').strip()
     if not re.match(r'^0\d{10}$', phone): return jsonify({'ok': False, 'error': 'Enter a valid 11-digit phone number.'}), 400
     if not code: return jsonify({'ok': False, 'error': 'Please select a data plan.'}), 400
+    if provider() == 'fatizara':
+        if not fatizara_configured():
+            return jsonify({'ok': False, 'error': 'Fatizara is not set up yet.'}), 503
+        rows = q("SELECT plan_id, name, cost FROM fatizara_plans "
+                 "WHERE plan_id=? AND service='data' AND network=?", (code, net))
+        if not rows:
+            return jsonify({'ok': False, 'error': 'This plan is no longer available. Refresh plans.'}), 400
+        p = rows[0]
+        cost = float(p['cost'] or 0)
+        price = fz_sell_price(code, cost)
+        ok, info = debit_and_buy_fatizara(
+            g.user_id, price, f"{p['name']} → {phone}", 'data', net, '/data',
+            {'network': FATIZARA_NETWORKS.get(net, 1), 'phone': phone,
+             'data_plan': int(code) if code.isdigit() else code, 'bypass': False})
+        return jsonify({'ok': ok, **info})
     svc = DATA_SVC.get(net, 'mtn-data')
     varis = {v.get('variation_code'): v for v in vt_variations(svc)}
     if code not in varis:
@@ -1125,6 +1262,13 @@ def buy_data():
 @auth
 def cable_plans():
     prov = (request.args.get('provider') or 'dstv').lower()
+    if provider() == 'fatizara':
+        rows = q("SELECT plan_id, name, cost FROM fatizara_plans "
+                 "WHERE service='cable' AND network=? ORDER BY cost", (prov,))
+        plans = [{'variation_code': r['plan_id'], 'name': r['name'],
+                  'cost': float(r['cost'] or 0),
+                  'price': fz_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
+        return jsonify({'ok': True, 'plans': plans})
     svc = CABLE_SVC.get(prov, 'dstv')
     varis = vt_variations(svc)
     plans = [{'variation_code': v.get('variation_code'), 'name': v.get('name'),
@@ -1143,6 +1287,32 @@ def verify():
     vtype = (d.get('type') or '').strip()
     if not service_id or len(billers) < 5:
         return jsonify({'ok': False, 'error': 'Enter a valid number.'}), 400
+    if provider() == 'fatizara':
+        if not fatizara_configured():
+            return jsonify({'ok': False, 'error': 'Fatizara is not set up yet.'}), 503
+        try:
+            if service_id in CABLE_SVC:
+                resp = fatizara_get('/cable/cable-validation',
+                                    {'iuc': billers, 'cable': FATIZARA_CABLES[service_id]})
+                if (resp.get('status') or '').lower() in ('success', 'successful') and resp.get('name'):
+                    return jsonify({'ok': True, 'customer': resp.get('name'), 'raw': resp})
+                return jsonify({'ok': False, 'error': 'Could not verify this number. Check and try again.'}), 400
+            if service_id in dict(DISCOS):
+                if not FATIZARA_METER_VERIFY_PATH:
+                    return jsonify({'ok': False, 'error': 'Meter verification is not set up for this disco yet.'}), 503
+                rows = q("SELECT fatizara_id FROM fatizara_discos WHERE disco_key=?", (service_id,))
+                if not rows:
+                    return jsonify({'ok': False, 'error': 'This disco is not mapped yet.'}), 400
+                resp = fatizara_get(FATIZARA_METER_VERIFY_PATH,
+                                    {'meter_number': billers, 'disco': rows[0]['fatizara_id'],
+                                     'meter_type': vtype or 'prepaid'})
+                if (resp.get('status') or '').lower() in ('success', 'successful'):
+                    name = resp.get('name') or resp.get('customer') or ''
+                    return jsonify({'ok': True, 'customer': name, 'raw': resp})
+                return jsonify({'ok': False, 'error': 'Could not verify this meter. Check and try again.'}), 400
+        except Exception:
+            return jsonify({'ok': False, 'error': 'Verification service unreachable.'}), 502
+        return jsonify({'ok': False, 'error': 'Verification is not available for this service.'}), 400
     payload = {'serviceID': service_id, 'billersCode': billers}
     if vtype: payload['type'] = vtype
     try:
@@ -1168,6 +1338,25 @@ def buy_cable():
     svc = CABLE_SVC.get(prov, 'dstv')
     if len(billers) < 5: return jsonify({'ok': False, 'error': 'Enter a valid smartcard / IUC number.'}), 400
     if not code: return jsonify({'ok': False, 'error': 'Please select a package.'}), 400
+    if provider() == 'fatizara':
+        if not fatizara_configured():
+            return jsonify({'ok': False, 'error': 'Fatizara is not set up yet.'}), 503
+        rows = q("SELECT plan_id, name, cost FROM fatizara_plans "
+                 "WHERE plan_id=? AND service='cable' AND network=?", (code, prov))
+        if not rows:
+            return jsonify({'ok': False, 'error': 'This package is no longer available.'}), 400
+        p = rows[0]
+        cost = float(p['cost'] or 0)
+        price = fz_sell_price(code, cost)
+        # Seeded cable ids carry a 'c:' prefix (to avoid colliding with data
+        # plan ids); Fatizara itself wants the plain numeric plan id.
+        raw_plan = code[2:] if code.startswith('c:') else code
+        ok, info = debit_and_buy_fatizara(
+            g.user_id, price, f"{prov.upper()} {p['name']} → {billers}",
+            'cable', prov, '/cable',
+            {'cable': FATIZARA_CABLES.get(prov, 2), 'iuc': billers,
+             'cable_plan': int(raw_plan) if raw_plan.isdigit() else raw_plan, 'bypass': False})
+        return jsonify({'ok': ok, **info})
     varis = {v.get('variation_code'): v for v in vt_variations(svc)}
     if code not in varis:
         return jsonify({'ok': False, 'error': 'This package is no longer available.'}), 400
@@ -1183,6 +1372,12 @@ def buy_cable():
 @app.get('/api/power/discos')
 @auth
 def discos():
+    if provider() == 'fatizara':
+        rows = q("SELECT disco_key, label FROM fatizara_discos ORDER BY label")
+        out = [{'serviceID': r['disco_key'], 'label': r['label'],
+                'types': [{'variation_code': 'prepaid', 'name': 'Prepaid'},
+                          {'variation_code': 'postpaid', 'name': 'Postpaid'}]} for r in rows]
+        return jsonify({'ok': True, 'discos': out})
     out = []
     for svc, label in DISCOS:
         varis = vt_variations(svc)
@@ -1204,6 +1399,20 @@ def buy_power():
     except: amount = 0
     if len(meter) < 5: return jsonify({'ok': False, 'error': 'Enter a valid meter number.'}), 400
     if amount < 500: return jsonify({'ok': False, 'error': 'Minimum payment is ₦500.'}), 400
+    if provider() == 'fatizara':
+        if not fatizara_configured():
+            return jsonify({'ok': False, 'error': 'Fatizara is not set up yet.'}), 503
+        rows = q("SELECT fatizara_id FROM fatizara_discos WHERE disco_key=?", (svc,))
+        if not rows:
+            return jsonify({'ok': False, 'error': 'This disco is not mapped yet.'}), 400
+        fz_disco = rows[0]['fatizara_id']
+        ok, info = debit_and_buy_fatizara(
+            g.user_id, amount, f'Electricity ₦{amount:,} ({vtype}) → {meter}',
+            'power', svc, '/bill',
+            {'disco': int(fz_disco) if str(fz_disco).isdigit() else fz_disco,
+             'meter_type': vtype,
+             'meter_number': meter, 'amount': amount, 'bypass': False})
+        return jsonify({'ok': ok, **info})
     ok, info = debit_and_buy(g.user_id, amount, f'Electricity ₦{amount:,} ({vtype}) → {meter}',
                              'power', svc,
                              {'serviceID': svc, 'billersCode': meter, 'variation_code': vtype,
@@ -1284,6 +1493,208 @@ def vt_balance():
         return jsonify({'ok': True, 'balance': bal})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 502
+
+@app.get('/api/admin/fatizara-balance')
+@admin_auth
+def fatizara_balance():
+    """Fatizara wallet balance comes from the /api/user auth response."""
+    if not fatizara_configured():
+        return jsonify({'ok': False, 'error': 'Fatizara username / password missing.'}), 502
+    try:
+        _, auth_resp = fatizara_token()
+        bal = auth_resp.get('balance')
+        try: bal = float(bal)
+        except (TypeError, ValueError): bal = None
+        if bal is None:
+            return jsonify({'ok': False, 'error': 'Could not read balance.'}), 502
+        return jsonify({'ok': True, 'balance': bal})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 502
+
+@app.get('/api/admin/fatizara-plans')
+@admin_auth
+def fatizara_plans_admin():
+    return jsonify({'ok': True, 'plans': q("SELECT * FROM fatizara_plans ORDER BY service, network, cost")})
+
+@app.post('/api/admin/fatizara-plan')
+@admin_auth
+def fatizara_plan_save():
+    d = request.get_json(force=True, silent=True) or {}
+    plan_id = (d.get('plan_id') or '').strip()
+    service = (d.get('service') or '').strip()
+    network = (d.get('network') or '').strip()
+    name = (d.get('name') or '').strip()
+    if not plan_id or service not in ('data', 'cable') or not name:
+        return jsonify({'ok': False, 'error': 'plan_id, service (data/cable) and name are required.'}), 400
+    try: cost = float(d.get('cost'))
+    except Exception: return jsonify({'ok': False, 'error': 'Enter a valid cost.'}), 400
+    sell = d.get('sell')
+    try: sell = None if sell in (None, '') else float(sell)
+    except Exception: return jsonify({'ok': False, 'error': 'Enter a valid sell price.'}), 400
+    run("""INSERT INTO fatizara_plans(plan_id,service,network,name,cost,sell,updated)
+           VALUES(?,?,?,?,?,?,?)
+           ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
+           network=excluded.network, name=excluded.name, cost=excluded.cost,
+           sell=excluded.sell, updated=excluded.updated""",
+        (plan_id, service, network, name, cost, sell, now_iso()))
+    return jsonify({'ok': True})
+
+@app.get('/api/admin/fatizara-discos')
+@admin_auth
+def fatizara_discos_admin():
+    return jsonify({'ok': True, 'discos': q("SELECT * FROM fatizara_discos ORDER BY label")})
+
+@app.post('/api/admin/fatizara-disco')
+@admin_auth
+def fatizara_disco_save():
+    d = request.get_json(force=True, silent=True) or {}
+    disco_key = (d.get('disco_key') or '').strip()
+    fz_id = (d.get('fatizara_id') or '').strip()
+    label = (d.get('label') or '').strip()
+    if not disco_key or not fz_id or not label:
+        return jsonify({'ok': False, 'error': 'disco_key, fatizara_id and label are required.'}), 400
+    run("""INSERT INTO fatizara_discos(disco_key,fatizara_id,label,updated)
+           VALUES(?,?,?,?)
+           ON CONFLICT(disco_key) DO UPDATE SET fatizara_id=excluded.fatizara_id,
+           label=excluded.label, updated=excluded.updated""",
+        (disco_key, fz_id, label, now_iso()))
+    return jsonify({'ok': True})
+
+@app.get('/api/admin/fatizara-cost-check')
+@admin_auth
+def fatizara_cost_check():
+    """Plans whose sell price sits below Fatizara cost — same idea as cost-check."""
+    out = []
+    for r in q("SELECT plan_id, service, network, name, cost, sell FROM fatizara_plans"):
+        cost = float(r['cost'] or 0)
+        sell = fz_sell_price(r['plan_id'], cost)
+        if sell < cost:
+            out.append({'plan': r['name'], 'code': r['plan_id'], 'service': r['service'],
+                        'cost': cost, 'sell': sell, 'loss': round(cost - sell, 2)})
+    return jsonify({'ok': True, 'losing': out})
+
+# Seed data transcribed from the Fatizara docs tables (2026-11-01).
+# cost = what Fatizara charges; sell starts empty (cost + margin) until
+# Mahmod sets retail prices in the admin panel. Re-seeding updates costs
+# and names but never overwrites an admin-set sell price.
+# Data rows: (plan_id, network, name, cost). Name carries plan type +
+# validity because the same size appears at several prices.
+FATIZARA_DATA_SEED = [
+    ('3', 'mtn', '1GB GIFTING MONTHLY', 650),
+    ('5', 'mtn', '2GB GIFTING MONTHLY', 1300),
+    ('6', 'mtn', '3GB GIFTING MONTHLY', 1950),
+    ('7', 'mtn', '5GB GIFTING MONTHLY', 3500),
+    ('46', 'mtn', '5GB GIFTING MONTHLY', 3350),
+    ('57', 'mtn', '2GB COOPERATE GIFTING +2mins Monthly Plan', 540),
+    ('58', 'mtn', '5GB COOPERATE GIFTING MONTHLY 30 DAYS', 1350),
+    ('59', 'mtn', '3GB COOPERATE GIFTING MONTHLY 30 DAYS', 810),
+    ('61', 'mtn', '1GB COOPERATE GIFTING MONTHLY 30 DAYS', 270),
+    ('62', 'mtn', '1GB SME MONTHLY', 370),
+    ('63', 'mtn', '2GB SME MONTHLY', 740),
+    ('64', 'mtn', '3GB SME MONTHLY', 1110),
+    ('65', 'mtn', '5GB SME MONTHLY', 1900),
+    ('66', 'mtn', '100GB SME 3 MONTHLY', 4000),
+    ('67', 'mtn', '500MB SME MONTHLY', 400),
+    ('68', 'mtn', '1GB SME MONTHLY 30 DAYS', 435),
+    ('9', 'airtel', '1.5GB COOPERATE GIFTING 2DAYS', 600),
+    ('10', 'airtel', '1GB COOPERATE GIFTING DAY', 500),
+    ('11', 'airtel', '3.2GB COOPERATE GIFTING 2DAYS', 800),
+    ('12', 'airtel', '6.5GB COOPERATE GIFTING Weekly', 1500),
+    ('13', 'airtel', '10GB COOPERATE GIFTING MONTHLY', 3500),
+    ('51', 'airtel', '3GB SME 7DAYS', 1100),
+    ('14', 'glo', '1.3GB GIFTING MONTHLY', 500),
+    ('15', 'glo', '2.9GB GIFTING MONTHLY', 1000),
+    ('16', 'glo', '4.1GB GIFTING MONTHLY', 1500),
+    ('17', 'glo', '5.2GB GIFTING MONTHLY', 2000),
+    ('30', 'glo', '500MB COOPERATE GIFTING MONTHLY', 210),
+    ('31', 'glo', '1GB COOPERATE GIFTING MONTHLY', 395),
+    ('32', 'glo', '2GB COOPERATE GIFTING MONTHLY', 790),
+    ('33', 'glo', '3GB COOPERATE GIFTING MONTHLY', 1185),
+    ('34', 'glo', '5GB COOPERATE GIFTING MONTHLY', 1425),
+    ('35', 'glo', '10GB COOPERATE GIFTING MONTHLY', 3950),
+    ('36', 'glo', '200MB COOPERATE GIFTING 14Days', 85),
+    ('18', 'etisalat', '1.5GB GIFTING MONTHLY', 1000),
+    ('19', 'etisalat', '2GB GIFTING MONTHLY', 1150),
+    ('20', 'etisalat', '3GB GIFTING MONTHLY', 1500),
+    ('21', 'etisalat', '500MB GIFTING MONTHLY', 480),
+    ('37', 'etisalat', '500MB COOPERATE GIFTING MONTHLY', 150),
+    ('38', 'etisalat', '1.1GB COOPERATE GIFTING MONTHLY', 320),
+    ('39', 'etisalat', '2.3GB COOPERATE GIFTING MONTHLY', 620),
+    ('40', 'etisalat', '3.3GB COOPERATE GIFTING MONTHLY', 900),
+    ('41', 'etisalat', '4.5GB COOPERATE GIFTING MONTHLY', 1400),
+]
+FATIZARA_CABLE_SEED = [
+    # (plan_id, network, name, cost)
+    ('3', 'gotv', 'Jinja', 2250),
+    ('4', 'gotv', 'Gotv Jolli', 3300),
+    ('5', 'gotv', 'Smallie-Monthly(Lite)', 1100),
+    ('6', 'gotv', 'Max', 4850),
+    ('7', 'gotv', 'Supa', 6400),
+    ('8', 'startimes', 'Nova-1month', 1200),
+    ('9', 'startimes', 'Basic(Antenna)-1 month', 2100),
+    ('10', 'startimes', 'Smart(Dish)-1month', 2900),
+    ('11', 'startimes', 'Classic(Antenna)-1month', 3100),
+    ('12', 'startimes', 'Super', 5400),
+    ('13', 'dstv', 'Padi', 2500),
+    ('14', 'dstv', 'Yanga', 3500),
+    ('15', 'dstv', 'Confam', 6200),
+    ('16', 'dstv', 'Compart', 10500),
+    ('17', 'dstv', 'Asia', 7100),
+    ('18', 'dstv', 'Confam + ExtraView', 8200),
+    ('19', 'dstv', 'Yanga + extra', 5850),
+    ('20', 'dstv', 'Padi+extra view', 5050),
+    ('21', 'dstv', 'HDPVR Access Service', 2900),
+    ('22', 'dstv', 'Asia addon', 7100),
+]
+# NOTE: data plan id '3' and cable plan id '3' collide on plan_id alone —
+# the seed below stores cable plans with a 'c:' prefix so the two tables
+# never clash. (Plan lookups always filter by service, so the prefix is
+# invisible to the frontend: it sends the plain docs id.)
+FATIZARA_DISCO_SEED = [
+    # (disco_key, fatizara_id, label) — Fatizara lists 8 discos; Enugu and
+    # Benin have no Fatizara mapping and stay unmapped under this provider.
+    ('ikeja-electric', '1', 'Ikeja Electric (IKEDC)'),
+    ('eko-electric', '2', 'Eko Electric (EKEDC)'),
+    ('kano-electric', '3', 'Kano Electric (KEDCO)'),
+    ('portharcourt-electric', '4', 'PH Electric (PHEDC)'),
+    ('jos-electric', '5', 'Jos Electric (JEDC)'),
+    ('ibadan-electric', '6', 'Ibadan Electric (IBEDC)'),
+    ('kaduna-electric', '7', 'Kaduna Electric (KAEDC)'),
+    ('abuja-electric', '8', 'Abuja Electric (AEDC)'),
+]
+
+@app.post('/api/admin/fatizara-seed-plans')
+@admin_auth
+def fatizara_seed_plans():
+    """Seed Fatizara plans + discos from the docs tables. Safe to re-run:
+    updates cost/name, never overwrites an admin-set sell price."""
+    n_plans = 0
+    for plan_id, network, name, cost in FATIZARA_DATA_SEED:
+        run("""INSERT INTO fatizara_plans(plan_id,service,network,name,cost,updated)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
+               network=excluded.network, name=excluded.name, cost=excluded.cost,
+               updated=excluded.updated""",
+            (plan_id, 'data', network, name, cost, now_iso()))
+        n_plans += 1
+    for plan_id, network, name, cost in FATIZARA_CABLE_SEED:
+        run("""INSERT INTO fatizara_plans(plan_id,service,network,name,cost,updated)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
+               network=excluded.network, name=excluded.name, cost=excluded.cost,
+               updated=excluded.updated""",
+            ('c:' + plan_id, 'cable', network, name, cost, now_iso()))
+        n_plans += 1
+    n_discos = 0
+    for disco_key, fz_id, label in FATIZARA_DISCO_SEED:
+        run("""INSERT INTO fatizara_discos(disco_key,fatizara_id,label,updated)
+               VALUES(?,?,?,?)
+               ON CONFLICT(disco_key) DO UPDATE SET fatizara_id=excluded.fatizara_id,
+               label=excluded.label, updated=excluded.updated""",
+            (disco_key, fz_id, label, now_iso()))
+        n_discos += 1
+    return jsonify({'ok': True, 'plans': n_plans, 'discos': n_discos,
+                    'note': 'Sell prices start at Fatizara cost — set retail prices in the admin panel before switching customers over.'})
 
 @app.get('/api/admin/users')
 @admin_auth
@@ -1402,6 +1813,8 @@ def admin_settings_save():
     value = '' if value is None else str(value)
     if key.endswith('_SANDBOX') and value not in ('0', '1'):
         return jsonify({'ok': False, 'error': 'Sandbox must be 0 or 1.'}), 400
+    if key == 'PROVIDER' and value not in ('vtpass', 'fatizara'):
+        return jsonify({'ok': False, 'error': 'Provider must be vtpass or fatizara.'}), 400
     run("""INSERT INTO settings(k,v,updated_at) VALUES(?,?,?)
            ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at""",
         (key, value, now_iso()))
@@ -1424,6 +1837,14 @@ def admin_test_connection():
             r = vt_get('/balance')
             bal = (r.get('content') or {}).get('balance', r)
             return jsonify({'ok': True, 'detail': f"Connected — wallet balance ₦{bal}."})
+        if service == 'fatizara':
+            if not fatizara_configured():
+                return jsonify({'ok': False, 'detail': 'Fatizara username / password missing.'})
+            try:
+                _, auth_resp = fatizara_token()
+                return jsonify({'ok': True, 'detail': f"Auth OK — wallet balance ₦{auth_resp.get('balance')}."})
+            except Exception as e:
+                return jsonify({'ok': False, 'detail': 'Auth failed: ' + str(e)[:120]})
         if service == 'monnify':
             if not monnify_configured():
                 return jsonify({'ok': False, 'detail': 'API key / secret / contract code missing.'})
