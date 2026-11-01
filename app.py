@@ -660,14 +660,19 @@ def bilal_token():
 
 def bilal_post(path, payload):
     tok, _ = bilal_token()
-    r = requests.post(BILAL_BASE + path, json=payload,
+    # NOTE: every Bilal API route lives under /api — the auth call uses
+    # '/api/user' and works, but these helpers used to call the bare website
+    # paths (e.g. '/data'), which return HTML error pages Bilal's dashboard
+    # never records. The '/api' prefix here is what makes buys reach Bilal.
+    r = requests.post(BILAL_BASE + '/api' + path, json=payload,
                       headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
                       timeout=45)
     return _provider_json(r, 'Bilal')
 
 def bilal_get(path, params=None):
     tok, _ = bilal_token()
-    r = requests.get(BILAL_BASE + path, params=params,
+    # Same '/api' prefix rule as bilal_post (see note there).
+    r = requests.get(BILAL_BASE + '/api' + path, params=params,
                      headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
                      timeout=30)
     return _provider_json(r, 'Bilal')
