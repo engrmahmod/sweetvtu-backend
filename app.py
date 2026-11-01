@@ -954,10 +954,17 @@ def change_pin():
 @limiter.limit('10 per minute')
 def login():
     d = request.get_json(force=True)
-    phone, pw = (d.get('phone') or '').strip(), d.get('password') or ''
-    rows = q("SELECT * FROM users WHERE phone=?", (phone,))
+    ident = (d.get('username') or d.get('phone') or '').strip()
+    pw = d.get('password') or ''
+    rows = q("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (ident,))
+    if not rows and re.match(r'^0\d{10}$', ident):
+        # Silent fallback for accounts created before usernames existed:
+        # a phone number still signs in an account that has no username yet.
+        cand = q("SELECT * FROM users WHERE phone=?", (ident,))
+        if cand and not (cand[0].get('username') or ''):
+            rows = cand
     if not rows or not check_password_hash(rows[0]['pass_hash'], pw):
-        return jsonify({'ok': False, 'error': 'Wrong number or password. Try again.'}), 401
+        return jsonify({'ok': False, 'error': 'Wrong username or password. Try again.'}), 401
     if not rows[0].get('email_verified'):
         return jsonify({'ok': False, 'error': 'Please verify your email first — check your inbox for the code.',
                         'verify_required': True, 'user_id': rows[0]['id']}), 403
