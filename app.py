@@ -351,9 +351,30 @@ def init_db():
              amount REAL, account_number TEXT, bank_name TEXT, bank_code TEXT,
              account_name TEXT, checkout_url TEXT, expiry TEXT,
              status TEXT DEFAULT 'PENDING', created TEXT, paid_at TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS staff_users(
+             id {auto}, email TEXT UNIQUE, role TEXT DEFAULT 'full',
+             active INTEGER DEFAULT 1, created TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS staff_codes(
+             id {auto}, email TEXT, code_hash TEXT,
+             expires_at TEXT, created TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS staff_sessions(
+             token TEXT PRIMARY KEY, staff_id INTEGER,
+             created TEXT, expires_at TEXT, last_seen TEXT)""",
     ]
     for s in stmts:
         run(s)
+    # Boss staff seat (shared code mailbox, full access minus secrets).
+    # Soft-delete only: removing a staffer sets active=0, so a redeploy
+    # can never resurrect access that the main admin revoked.
+    # NOTE: now_iso() is defined below init_db(), so the seed uses a
+    # plain UTC timestamp here instead of calling it.
+    try:
+        run("""INSERT OR IGNORE INTO staff_users(email,role,active,created)
+               VALUES(?,?,?,?)""",
+            ('pantherdata1@gmail.com', 'full', 1,
+             datetime.now(timezone.utc).isoformat(timespec='seconds')))
+    except Exception:
+        pass
     # migrate older databases that lack the new columns
     for col, tbl in (("email_verified INTEGER DEFAULT 0", "users"),
                      ("tx_pin_hash TEXT", "users"),
@@ -516,31 +537,62 @@ def new_admin_session(remember):
 def admin_session_auth(f):
     """Admin endpoints require a verified session token, not the raw key.
     The key alone only opens the two code endpoints below; every other
-    admin call must carry X-Admin-Session from a key + code sign-in."""
+    admin call must carry X-Admin-Session from a key + code sign-in, or
+    from a staff email-code sign-in (staff tokens live in staff_sessions
+    and set g.is_staff; staff can do everything except settings, test
+    connections and staff management, which stay with the main admin —
+    and secret settings values are never shown to staff)."""
     @wraps(f)
     def wrapper(*a, **kw):
         tok = (request.headers.get('X-Admin-Session') or '').strip()
         if not tok:
             return jsonify({'ok': False, 'error': 'Admin session required. Sign in again.'}), 403
-        rows = q("SELECT expires_at FROM admin_sessions WHERE token=?", (tok,))
-        if not rows:
-            return jsonify({'ok': False, 'error': 'Admin session required. Sign in again.'}), 403
         now = now_iso()
-        if rows[0].get('expires_at') and rows[0]['expires_at'] < now:
-            run("DELETE FROM admin_sessions WHERE token=?", (tok,))
+        rows = q("SELECT expires_at FROM admin_sessions WHERE token=?", (tok,))
+        if rows:
+            if rows[0].get('expires_at') and rows[0]['expires_at'] < now:
+                run("DELETE FROM admin_sessions WHERE token=?", (tok,))
+                return jsonify({'ok': False, 'error': 'Admin session expired. Sign in again.'}), 403
+            run("UPDATE admin_sessions SET last_seen=? WHERE token=?", (now, tok))
+            g.is_staff = False
+            g.staff_role = None
+            g.staff_email = None
+            return f(*a, **kw)
+        srows = q("SELECT staff_id, expires_at FROM staff_sessions WHERE token=?", (tok,))
+        if not srows:
+            return jsonify({'ok': False, 'error': 'Admin session required. Sign in again.'}), 403
+        if srows[0].get('expires_at') and srows[0]['expires_at'] < now:
+            run("DELETE FROM staff_sessions WHERE token=?", (tok,))
             return jsonify({'ok': False, 'error': 'Admin session expired. Sign in again.'}), 403
-        run("UPDATE admin_sessions SET last_seen=? WHERE token=?", (now, tok))
+        urows = q("SELECT email, role, active FROM staff_users WHERE id=?", (srows[0]['staff_id'],))
+        if not urows or not urows[0].get('active'):
+            run("DELETE FROM staff_sessions WHERE token=?", (tok,))
+            return jsonify({'ok': False, 'error': 'Admin session required. Sign in again.'}), 403
+        run("UPDATE staff_sessions SET last_seen=? WHERE token=?", (now, tok))
+        g.is_staff = True
+        g.staff_role = urows[0].get('role')
+        g.staff_email = urows[0].get('email')
         return f(*a, **kw)
     return wrapper
 
+def _main_admin_only():
+    """Refuse staff sessions on main-admin-only endpoints (settings,
+    connection tests, staff management). Returns a 403 response, or
+    None when the caller is the main admin."""
+    if getattr(g, 'is_staff', False):
+        return jsonify({'ok': False, 'error': 'Only the main admin can do this.'}), 403
+    return None
+
 def admin_export_auth(f):
     """Read-only export endpoints ONLY (users, transactions, prices, user
-    detail — the four the daily backup script pulls). Accepts either a
-    verified admin session (same as admin_session_auth) or the separate
-    BACKUP_KEY, which works on these four endpoints and nowhere else:
-    it cannot adjust wallets, change prices or settings, reset passwords
-    or PINs, delete users, or open the admin page. The admin key + code
-    login is unchanged, and customer sign-in is untouched."""
+    detail — the four the daily backup script pulls). Accepts a verified
+    admin session, a verified staff session (staff read the same lists
+    the admin page shows — this is what makes staff sign-in work at
+    all), or the separate BACKUP_KEY, which works on these four
+    endpoints and nowhere else: it cannot adjust wallets, change prices
+    or settings, reset passwords or PINs, delete users, or open the
+    admin page. The admin key + code login is unchanged, and customer
+    sign-in is untouched."""
     @wraps(f)
     def wrapper(*a, **kw):
         tok = (request.headers.get('X-Admin-Session') or '').strip()
@@ -550,7 +602,21 @@ def admin_export_auth(f):
                 now = now_iso()
                 if not rows[0].get('expires_at') or rows[0]['expires_at'] >= now:
                     run("UPDATE admin_sessions SET last_seen=? WHERE token=?", (now, tok))
+                    g.is_staff = False
+                    g.staff_role = None
+                    g.staff_email = None
                     return f(*a, **kw)
+            srows = q("SELECT staff_id, expires_at FROM staff_sessions WHERE token=?", (tok,))
+            if srows:
+                now = now_iso()
+                if not srows[0].get('expires_at') or srows[0]['expires_at'] >= now:
+                    urows = q("SELECT email, role, active FROM staff_users WHERE id=?", (srows[0]['staff_id'],))
+                    if urows and urows[0].get('active'):
+                        run("UPDATE staff_sessions SET last_seen=? WHERE token=?", (now, tok))
+                        g.is_staff = True
+                        g.staff_role = urows[0].get('role')
+                        g.staff_email = urows[0].get('email')
+                        return f(*a, **kw)
         bkey = (request.headers.get('X-Backup-Key') or '').strip()
         if BACKUP_KEY and bkey and bkey == BACKUP_KEY:
             return f(*a, **kw)
@@ -2607,14 +2673,19 @@ def cost_check():
 @app.get('/api/admin/settings')
 @admin_session_auth
 def admin_settings():
+    # Staff sessions never see secret values: they come back blank.
+    staff = getattr(g, 'is_staff', False)
     items = [{'key': k, 'group': m['group'], 'label': m['label'],
-              'secret': m['secret'], 'value': S(k)}
+              'secret': m['secret'], 'value': ('' if (staff and m['secret']) else S(k))}
              for k, m in SETTINGS_META.items()]
     return jsonify({'ok': True, 'settings': items})
 
 @app.post('/api/admin/settings')
 @admin_session_auth
 def admin_settings_save():
+    blocked = _main_admin_only()
+    if blocked:
+        return blocked
     d = request.get_json(force=True, silent=True) or {}
     key = (d.get('key') or '').strip()
     value = d.get('value')
@@ -2639,6 +2710,9 @@ def admin_settings_save():
 @app.post('/api/admin/test-connection')
 @admin_session_auth
 def admin_test_connection():
+    blocked = _main_admin_only()
+    if blocked:
+        return blocked
     d = request.get_json(force=True, silent=True) or {}
     service = (d.get('service') or '').strip().lower()
     try:
@@ -2951,6 +3025,113 @@ def admin_verify_code():
 def admin_logout():
     tok = (request.headers.get('X-Admin-Session') or '').strip()
     run("DELETE FROM admin_sessions WHERE token=?", (tok,))
+    return jsonify({'ok': True})
+
+# ---------------- staff sign-in (email code, no admin key) ----------------
+# Staff accounts are allowlisted by email in staff_users. A staff sign-in
+# is email + emailed code only: no admin key is ever given to staff.
+# Staff sessions are 12 hours, and staff can do everything the main
+# admin can except settings, connection tests and staff management
+# (see _main_admin_only). Staff read the same four list endpoints the
+# admin page uses (see admin_export_auth); they do not get the
+# BACKUP_KEY, and the Backup button is hidden from them in the page.
+@app.post('/api/staff/request-code')
+@limiter.limit('3 per minute')
+def staff_request_code():
+    """Step 1 of staff sign-in: sends a 6-digit code (15-min expiry)
+    to the staff email, but only when that email is an active staffer."""
+    d = request.get_json(force=True, silent=True) or {}
+    email = (d.get('email') or '').strip().lower()
+    if not email or not q("SELECT id FROM staff_users WHERE email=? AND active=1", (email,)):
+        return jsonify({'ok': False, 'error': 'This email has no staff access.'}), 404
+    code = str(secrets.randbelow(900000) + 100000)
+    chash = hashlib.sha256(code.encode()).hexdigest()
+    exp = (datetime.now(LAGOS) + timedelta(minutes=15)).isoformat(timespec='seconds')
+    run("DELETE FROM staff_codes WHERE email=?", (email,))
+    run("INSERT INTO staff_codes(email,code_hash,expires_at,created) VALUES(?,?,?,?)",
+        (email, chash, exp, now_iso()))
+    sent = send_email(email, 'Your Panther Data admin sign-in code',
+        f"Hello,\n\nYour Panther Data admin sign-in code is:\n\n{code}\n\n"
+        f"Enter this code to open the admin area. It expires in 15 minutes.\n\n"
+        f"If you did not try to sign in, ignore this email.\n\n— Panther Data")
+    return jsonify({'ok': True, 'email_sent': bool(sent)})
+
+@app.post('/api/staff/verify-code')
+@limiter.limit('10 per minute')
+def staff_verify_code():
+    """Step 2 of staff sign-in: email + code -> staff session token."""
+    d = request.get_json(force=True, silent=True) or {}
+    email = (d.get('email') or '').strip().lower()
+    code = str(d.get('code') or '').strip()
+    rows = q("SELECT * FROM staff_codes WHERE email=? ORDER BY id DESC LIMIT 1", (email,))
+    chash = hashlib.sha256(code.encode()).hexdigest()
+    if not rows or rows[0]['code_hash'] != chash:
+        return jsonify({'ok': False, 'error': 'Wrong code. Check the email and try again.'}), 400
+    if rows[0]['expires_at'] < now_iso():
+        return jsonify({'ok': False, 'error': 'Code expired. Request a new one.'}), 400
+    urows = q("SELECT id, role FROM staff_users WHERE email=? AND active=1", (email,))
+    if not urows:
+        return jsonify({'ok': False, 'error': 'This email has no staff access.'}), 403
+    run("DELETE FROM staff_codes WHERE email=?", (email,))
+    tok = secrets.token_hex(32)
+    exp = (datetime.now(LAGOS) + timedelta(hours=12)).isoformat(timespec='seconds')
+    run("INSERT INTO staff_sessions(token,staff_id,created,expires_at,last_seen) VALUES(?,?,?,?,?)",
+        (tok, urows[0]['id'], now_iso(), exp, now_iso()))
+    log_admin('staff_login', f'staff {email} signed in with email code')
+    return jsonify({'ok': True, 'staff_session': tok, 'expires_at': exp,
+                    'role': urows[0]['role'], 'email': email})
+
+@app.post('/api/staff/logout')
+def staff_logout():
+    tok = (request.headers.get('X-Admin-Session') or '').strip()
+    run("DELETE FROM staff_sessions WHERE token=?", (tok,))
+    return jsonify({'ok': True})
+
+@app.get('/api/staff/me')
+@admin_session_auth
+def staff_me():
+    """Who this session belongs to: main admin, or a staffer (role +
+    email). The admin page uses it to hide main-admin-only pages."""
+    return jsonify({'ok': True, 'is_staff': bool(getattr(g, 'is_staff', False)),
+                    'role': getattr(g, 'staff_role', None),
+                    'email': getattr(g, 'staff_email', None)})
+
+@app.get('/api/admin/staff')
+@admin_session_auth
+def admin_staff_list():
+    blocked = _main_admin_only()
+    if blocked:
+        return blocked
+    return jsonify({'ok': True, 'staff': q(
+        "SELECT email, role, active, created FROM staff_users ORDER BY id")})
+
+@app.post('/api/admin/staff')
+@admin_session_auth
+def admin_staff_add():
+    blocked = _main_admin_only()
+    if blocked:
+        return blocked
+    d = request.get_json(force=True, silent=True) or {}
+    email = (d.get('email') or '').strip().lower()
+    if not email or '@' not in email:
+        return jsonify({'ok': False, 'error': 'Enter a valid email.'}), 400
+    run("""INSERT INTO staff_users(email,role,active,created) VALUES(?,?,?,?)
+           ON CONFLICT(email) DO UPDATE SET role=excluded.role, active=1""",
+        (email, 'full', 1, now_iso()))
+    log_admin('staff_add', email)
+    return jsonify({'ok': True})
+
+@app.post('/api/admin/staff/remove')
+@admin_session_auth
+def admin_staff_remove():
+    blocked = _main_admin_only()
+    if blocked:
+        return blocked
+    d = request.get_json(force=True, silent=True) or {}
+    email = (d.get('email') or '').strip().lower()
+    run("UPDATE staff_users SET active=0 WHERE email=?", (email,))
+    run("DELETE FROM staff_sessions WHERE staff_id IN (SELECT id FROM staff_users WHERE email=?)", (email,))
+    log_admin('staff_remove', email)
     return jsonify({'ok': True})
 
 @app.post('/api/admin/user-login-2fa')
