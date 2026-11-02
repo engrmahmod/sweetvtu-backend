@@ -237,6 +237,7 @@ _SECURITY_COLS = (
     ("pin_fails INTEGER DEFAULT 0", "users"),
     ("pin_locked_until TEXT", "users"),
     ("last_login_ip TEXT", "users"),
+    ("login_2fa INTEGER DEFAULT 0", "users"),
 )
 
 def _try_security_migration():
@@ -264,16 +265,18 @@ def _try_security_migration():
             if USE_PG:
                 rows = q("SELECT table_name, column_name FROM information_schema.columns "
                          "WHERE (table_name='tokens' AND column_name IN ('expires_at','last_seen')) "
-                         "OR (table_name='users' AND column_name IN ('pin_fails','pin_locked_until','last_login_ip'))")
+                         "OR (table_name='users' AND column_name IN ('pin_fails','pin_locked_until','last_login_ip','login_2fa'))")
                 found = {(r['table_name'], r['column_name']) for r in rows}
                 need = {('tokens','expires_at'), ('tokens','last_seen'),
-                        ('users','pin_fails'), ('users','pin_locked_until'), ('users','last_login_ip')}
+                        ('users','pin_fails'), ('users','pin_locked_until'), ('users','last_login_ip'),
+                        ('users','login_2fa')}
             else:
                 trows = [r['name'] for r in q("PRAGMA table_info(tokens)")]
                 urows = [r['name'] for r in q("PRAGMA table_info(users)")]
                 found = {('tokens',c) for c in trows} | {('users',c) for c in urows}
                 need = {('tokens','expires_at'), ('tokens','last_seen'),
-                        ('users','pin_fails'), ('users','pin_locked_until'), ('users','last_login_ip')}
+                        ('users','pin_fails'), ('users','pin_locked_until'), ('users','last_login_ip'),
+                        ('users','login_2fa')}
             if need.issubset(found):
                 NEW_COLS_READY = True
                 return True
@@ -338,6 +341,10 @@ def init_db():
         f"""CREATE TABLE IF NOT EXISTS announcements(
              id {auto}, title TEXT, body TEXT, audience TEXT DEFAULT 'all',
              active INTEGER DEFAULT 1, created TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS admin_sessions(
+             token TEXT PRIMARY KEY, created TEXT, expires_at TEXT, last_seen TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS admin_codes(
+             id {auto}, code_hash TEXT, expires_at TEXT, created TEXT)""",
     ]
     for s in stmts:
         run(s)
@@ -482,9 +489,61 @@ def log_admin(action, detail=''):
     except Exception:
         pass
 
+def admin_email():
+    """Where admin sign-in codes go. Set ADMIN_EMAIL on the server to
+    choose the inbox; otherwise the business mailbox is used."""
+    try:
+        return os.environ.get('ADMIN_EMAIL', '') or SMTP_USER or S('BREVO_SENDER')
+    except Exception:
+        return os.environ.get('ADMIN_EMAIL', '') or SMTP_USER
+
+def new_admin_session(remember):
+    """Issue a session token after key + code. Remembered sessions last
+    30 days like customer sessions; otherwise 12 hours."""
+    tok = secrets.token_hex(32)
+    exp = (datetime.now(LAGOS) + (timedelta(days=SESSION_ABS_DAYS) if remember
+           else timedelta(hours=12))).isoformat(timespec='seconds')
+    run("INSERT INTO admin_sessions(token,created,expires_at,last_seen) VALUES(?,?,?,?)",
+        (tok, now_iso(), exp, now_iso()))
+    return tok, exp
+
+def admin_session_auth(f):
+    """Admin endpoints require a verified session token, not the raw key.
+    The key alone only opens the two code endpoints below; every other
+    admin call must carry X-Admin-Session from a key + code sign-in."""
+    @wraps(f)
+    def wrapper(*a, **kw):
+        tok = (request.headers.get('X-Admin-Session') or '').strip()
+        if not tok:
+            return jsonify({'ok': False, 'error': 'Admin session required. Sign in again.'}), 403
+        rows = q("SELECT expires_at FROM admin_sessions WHERE token=?", (tok,))
+        if not rows:
+            return jsonify({'ok': False, 'error': 'Admin session required. Sign in again.'}), 403
+        now = now_iso()
+        if rows[0].get('expires_at') and rows[0]['expires_at'] < now:
+            run("DELETE FROM admin_sessions WHERE token=?", (tok,))
+            return jsonify({'ok': False, 'error': 'Admin session expired. Sign in again.'}), 403
+        run("UPDATE admin_sessions SET last_seen=? WHERE token=?", (now, tok))
+        return f(*a, **kw)
+    return wrapper
+
 def get_user(uid):
-    rows = q("SELECT id,name,username,phone,email,wallet,email_verified,created,monnify_ref,monnify_acct,monnify_bank,monnify_acct_name FROM users WHERE id=?", (uid,))
-    return rows[0] if rows else None
+    try:
+        rows = q("SELECT id,name,username,phone,email,wallet,email_verified,created,monnify_ref,monnify_acct,monnify_bank,monnify_acct_name,login_2fa FROM users WHERE id=?", (uid,))
+    except Exception:
+        # Column not migrated yet (migration pending): fall back without it.
+        rows = q("SELECT id,name,username,phone,email,wallet,email_verified,created,monnify_ref,monnify_acct,monnify_bank,monnify_acct_name FROM users WHERE id=?", (uid,))
+        if not rows:
+            return None
+        u = dict(rows[0])
+        u['login_2fa'] = 0
+        return u
+    if not rows:
+        return None
+    u = dict(rows[0])
+    # Old rows predate the column; treat a missing flag as off.
+    u['login_2fa'] = 1 if u.get('login_2fa') else 0
+    return u
 
 # ---------------- email verification ----------------
 def send_email(to_email, subject, body):
@@ -982,8 +1041,9 @@ def login():
     if not rows[0].get('email_verified'):
         return jsonify({'ok': False, 'error': 'Please verify your email first — check your inbox for the code.',
                         'verify_required': True, 'user_id': rows[0]['id']}), 403
-    tok = new_session_token(rows[0]['id'])
     # Login alert: email the user if this sign-in comes from a new IP address.
+    # Runs on password success, before any second-factor step, so the owner
+    # is alerted even if an attacker knows the password but not the code.
     try:
         if NEW_COLS_READY:
             fwd = (request.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
@@ -1004,7 +1064,80 @@ def login():
                 run("UPDATE users SET last_login_ip=? WHERE id=?", (ip, rows[0]['id']))
     except Exception:
         pass
+    # Optional second factor: password passed, but no session yet. The code
+    # goes to the account's own email; the session token is only issued
+    # after /api/verify-login-code succeeds.
+    if rows[0].get('login_2fa'):
+        code = new_email_code(rows[0]['id'], 'login')
+        sent = send_email(rows[0]['email'], 'Your Panther Data sign-in code',
+            f"Hello {rows[0].get('name') or 'there'},\n\nYour Panther Data sign-in code is:\n\n"
+            f"{code}\n\nEnter this code to finish signing in. It expires in 15 minutes.\n\n"
+            f"If you did not try to sign in, change your password immediately.\n\n— Panther Data")
+        return jsonify({'ok': True, 'login_2fa_required': True, 'user_id': rows[0]['id'],
+                        'email_sent': bool(sent)})
+    tok = new_session_token(rows[0]['id'])
     return jsonify({'ok': True, 'token': tok, 'user': get_user(rows[0]['id'])})
+
+@app.post('/api/verify-login-code')
+@limiter.limit('10 per minute')
+def verify_login_code():
+    """Finish a sign-in for an account with login codes turned on."""
+    d = request.get_json(force=True)
+    try: uid = int(d.get('user_id') or 0)
+    except: uid = 0
+    code = str(d.get('code') or '').strip()
+    user = get_user(uid)
+    if not user:
+        return jsonify({'ok': False, 'error': 'Account not found. Sign in again.'}), 404
+    rows = q("SELECT * FROM email_codes WHERE user_id=? AND purpose='login'", (uid,))
+    chash = hashlib.sha256(code.encode()).hexdigest()
+    if not rows or rows[0]['code_hash'] != chash:
+        return jsonify({'ok': False, 'error': 'Wrong code. Check the email and try again.'}), 400
+    if rows[0]['expires_at'] < now_iso():
+        return jsonify({'ok': False, 'error': 'Code expired. Sign in again for a new one.'}), 400
+    run("DELETE FROM email_codes WHERE user_id=? AND purpose='login'", (uid,))
+    tok = new_session_token(uid)
+    return jsonify({'ok': True, 'token': tok, 'user': get_user(uid)})
+
+@app.post('/api/resend-login-code')
+@limiter.limit('3 per minute')
+def resend_login_code():
+    d = request.get_json(force=True)
+    try: uid = int(d.get('user_id') or 0)
+    except: uid = 0
+    user = get_user(uid)
+    if not user:
+        return jsonify({'ok': False, 'error': 'Account not found. Sign in again.'}), 404
+    if not user.get('login_2fa'):
+        return jsonify({'ok': False, 'error': 'Sign-in codes are not turned on for this account.'}), 400
+    code = new_email_code(uid, 'login')
+    sent = send_email(user['email'], 'Your Panther Data sign-in code',
+        f"Hello {user['name']},\n\nYour Panther Data sign-in code is:\n\n"
+        f"{code}\n\nEnter this code to finish signing in. It expires in 15 minutes.\n\n— Panther Data")
+    return jsonify({'ok': True, 'email_sent': bool(sent)})
+
+@app.post('/api/login-2fa')
+@limiter.limit('10 per minute')
+@auth
+def login_2fa():
+    """Customer's own switch for optional sign-in codes. Off by default."""
+    d = request.get_json(force=True)
+    enabled = bool(d.get('enabled'))
+    try:
+        run("UPDATE users SET login_2fa=? WHERE id=?", (1 if enabled else 0, g.user_id))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Please try again in a minute.'}), 503
+    user = get_user(g.user_id)
+    try:
+        sent = send_email(user['email'],
+            'Panther Data sign-in codes ' + ('turned on' if enabled else 'turned off'),
+            f"Hello {user['name']},\n\nSign-in codes by email have been "
+            f"{'turned on' if enabled else 'turned off'} for your Panther Data account.\n\n"
+            f"If this was not you, sign in and turn them back "
+            f"{'off' if enabled else 'on'}, then change your password.\n\n— Panther Data")
+    except Exception:
+        sent = False
+    return jsonify({'ok': True, 'login_2fa': enabled, 'email_sent': bool(sent)})
 
 @app.post('/api/logout')
 @auth
@@ -1780,7 +1913,7 @@ def network_status():
 
 # ---------------- admin ----------------
 @app.get('/api/admin/vtpass-balance')
-@admin_auth
+@admin_session_auth
 def vt_balance():
     try:
         raw = vt_get('/balance')
@@ -1804,7 +1937,7 @@ def vt_balance():
         return jsonify({'ok': False, 'error': str(e)}), 502
 
 @app.get('/api/admin/fatizara-balance')
-@admin_auth
+@admin_session_auth
 def fatizara_balance():
     """Fatizara wallet balance comes from the /api/user auth response."""
     if not fatizara_configured():
@@ -1821,12 +1954,12 @@ def fatizara_balance():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 502
 
 @app.get('/api/admin/fatizara-plans')
-@admin_auth
+@admin_session_auth
 def fatizara_plans_admin():
     return jsonify({'ok': True, 'plans': q("SELECT * FROM fatizara_plans ORDER BY service, network, cost")})
 
 @app.post('/api/admin/fatizara-plan')
-@admin_auth
+@admin_session_auth
 def fatizara_plan_save():
     d = request.get_json(force=True, silent=True) or {}
     plan_id = (d.get('plan_id') or '').strip()
@@ -1849,12 +1982,12 @@ def fatizara_plan_save():
     return jsonify({'ok': True})
 
 @app.get('/api/admin/fatizara-discos')
-@admin_auth
+@admin_session_auth
 def fatizara_discos_admin():
     return jsonify({'ok': True, 'discos': q("SELECT * FROM fatizara_discos ORDER BY label")})
 
 @app.post('/api/admin/fatizara-disco')
-@admin_auth
+@admin_session_auth
 def fatizara_disco_save():
     d = request.get_json(force=True, silent=True) or {}
     disco_key = (d.get('disco_key') or '').strip()
@@ -1870,7 +2003,7 @@ def fatizara_disco_save():
     return jsonify({'ok': True})
 
 @app.get('/api/admin/fatizara-cost-check')
-@admin_auth
+@admin_session_auth
 def fatizara_cost_check():
     """Plans whose sell price sits below Fatizara cost — same idea as cost-check."""
     out = []
@@ -1973,7 +2106,7 @@ FATIZARA_DISCO_SEED = [
 ]
 
 @app.post('/api/admin/fatizara-seed-plans')
-@admin_auth
+@admin_session_auth
 def fatizara_seed_plans():
     """Seed Fatizara plans + discos from the docs tables. Safe to re-run:
     updates cost/name, never overwrites an admin-set sell price."""
@@ -2006,7 +2139,7 @@ def fatizara_seed_plans():
                     'note': 'Sell prices start at Fatizara cost — set retail prices in the admin panel before switching customers over.'})
 
 @app.get('/api/admin/bilal-balance')
-@admin_auth
+@admin_session_auth
 def bilal_balance():
     """Bilal wallet balance comes from the /api/user auth response."""
     if not bilal_configured():
@@ -2023,12 +2156,12 @@ def bilal_balance():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 502
 
 @app.get('/api/admin/bilal-plans')
-@admin_auth
+@admin_session_auth
 def bilal_plans_admin():
     return jsonify({'ok': True, 'plans': q("SELECT * FROM bilal_plans ORDER BY service, network, cost")})
 
 @app.post('/api/admin/bilal-plan')
-@admin_auth
+@admin_session_auth
 def bilal_plan_save():
     d = request.get_json(force=True, silent=True) or {}
     plan_id = (d.get('plan_id') or '').strip()
@@ -2052,12 +2185,12 @@ def bilal_plan_save():
     return jsonify({'ok': True})
 
 @app.get('/api/admin/bilal-discos')
-@admin_auth
+@admin_session_auth
 def bilal_discos_admin():
     return jsonify({'ok': True, 'discos': q("SELECT * FROM bilal_discos ORDER BY label")})
 
 @app.post('/api/admin/bilal-disco')
-@admin_auth
+@admin_session_auth
 def bilal_disco_save():
     d = request.get_json(force=True, silent=True) or {}
     disco_key = (d.get('disco_key') or '').strip()
@@ -2073,7 +2206,7 @@ def bilal_disco_save():
     return jsonify({'ok': True})
 
 @app.get('/api/admin/bilal-cost-check')
-@admin_auth
+@admin_session_auth
 def bilal_cost_check():
     """Plans whose sell price sits below Bilal cost — same idea as cost-check."""
     out = []
@@ -2106,7 +2239,7 @@ BILAL_CATALOG_NETWORKS = {'MTN': 'mtn', 'AIRTEL': 'airtel', 'GLO': 'glo',
 BILAL_CATALOG_CABLES = {'DSTV': 'dstv', 'GOTV': 'gotv', 'STARTIMES': 'startimes'}
 
 @app.post('/api/admin/bilal-seed-plans')
-@admin_auth
+@admin_session_auth
 def bilal_seed_plans():
     """Seed Bilal discos from the dashboard mapping, then — if Bilal
     credentials are set — pull the live catalogs (data + cable plans at
@@ -2170,7 +2303,7 @@ def bilal_seed_plans():
                     ' Sell prices start at Bilal cost — set retail prices in the admin panel before switching customers over.'})
 
 @app.get('/api/admin/bilal-requery')
-@admin_auth
+@admin_session_auth
 def bilal_requery():
     """Resolve a pending Bilal transaction via GET /api/requery/{request-id}.
     Only applies to transactions still pending: success marks it successful,
@@ -2201,13 +2334,13 @@ def bilal_requery():
     return jsonify({'ok': True, 'status': tstatus or 'pending'})
 
 @app.get('/api/admin/users')
-@admin_auth
+@admin_session_auth
 def admin_users():
     return jsonify({'ok': True, 'users': q(
         "SELECT id,name,username,phone,email,email_verified,wallet,created FROM users ORDER BY id DESC LIMIT 500")})
 
 @app.post('/api/admin/wallet')
-@admin_auth
+@admin_session_auth
 def admin_wallet():
     d = request.get_json(force=True)
     phone = (d.get('phone') or '').strip()
@@ -2228,19 +2361,19 @@ def admin_wallet():
     return jsonify({'ok': True})
 
 @app.get('/api/admin/transactions')
-@admin_auth
+@admin_session_auth
 def admin_txs():
     return jsonify({'ok': True, 'transactions': q(
         """SELECT t.*, u.phone FROM transactions t LEFT JOIN users u ON u.id=t.user_id
            ORDER BY t.id DESC LIMIT 500""")})
 
 @app.get('/api/admin/prices')
-@admin_auth
+@admin_session_auth
 def admin_prices():
     return jsonify({'ok': True, 'prices': q("SELECT * FROM plan_prices ORDER BY label")})
 
 @app.post('/api/admin/price')
-@admin_auth
+@admin_session_auth
 def admin_price():
     d = request.get_json(force=True)
     code = (d.get('variation_code') or '').strip()
@@ -2255,7 +2388,7 @@ def admin_price():
     return jsonify({'ok': True})
 
 @app.post('/api/admin/seed-prices')
-@admin_auth
+@admin_session_auth
 def seed_prices():
     """Match Mahmod's retail price list to live VTpass variations."""
     RETAIL = {
@@ -2286,7 +2419,7 @@ def seed_prices():
                     'note': 'Plans marked below_cost lose money on every sale — raise them in Prices.'})
 
 @app.get('/api/admin/cost-check')
-@admin_auth
+@admin_session_auth
 def cost_check():
     """Compare sell prices vs live VTpass cost for data plans."""
     out = []
@@ -2302,7 +2435,7 @@ def cost_check():
 
 # ---------------- runtime settings (admin-editable API keys) ----------------
 @app.get('/api/admin/settings')
-@admin_auth
+@admin_session_auth
 def admin_settings():
     items = [{'key': k, 'group': m['group'], 'label': m['label'],
               'secret': m['secret'], 'value': S(k)}
@@ -2310,7 +2443,7 @@ def admin_settings():
     return jsonify({'ok': True, 'settings': items})
 
 @app.post('/api/admin/settings')
-@admin_auth
+@admin_session_auth
 def admin_settings_save():
     d = request.get_json(force=True, silent=True) or {}
     key = (d.get('key') or '').strip()
@@ -2334,7 +2467,7 @@ def admin_settings_save():
     return jsonify({'ok': True})
 
 @app.post('/api/admin/test-connection')
-@admin_auth
+@admin_session_auth
 def admin_test_connection():
     d = request.get_json(force=True, silent=True) or {}
     service = (d.get('service') or '').strip().lower()
@@ -2433,16 +2566,22 @@ def reset_password():
 
 # ---------------- admin: user detail / password / delete ----------------
 @app.get('/api/admin/user')
-@admin_auth
+@admin_session_auth
 def admin_user():
     try: uid = int(request.args.get('id') or 0)
     except Exception: uid = 0
-    rows = q("SELECT id,name,username,phone,email,email_verified,wallet,created,"
-             "monnify_ref,monnify_acct,monnify_bank,monnify_acct_name "
-             "FROM users WHERE id=?", (uid,))
+    try:
+        rows = q("SELECT id,name,username,phone,email,email_verified,wallet,created,"
+                 "monnify_ref,monnify_acct,monnify_bank,monnify_acct_name,login_2fa "
+                 "FROM users WHERE id=?", (uid,))
+    except Exception:
+        rows = q("SELECT id,name,username,phone,email,email_verified,wallet,created,"
+                 "monnify_ref,monnify_acct,monnify_bank,monnify_acct_name "
+                 "FROM users WHERE id=?", (uid,))
     if not rows:
         return jsonify({'ok': False, 'error': 'User not found.'}), 404
     u = dict(rows[0])
+    u['login_2fa'] = 1 if u.get('login_2fa') else 0
     cnt = q("SELECT COUNT(*) c FROM transactions WHERE user_id=?", (uid,))
     u['tx_count'] = cnt[0]['c'] if cnt else 0
     u['recent'] = q("SELECT id,type,service,description,amount,direction,status,reference,created "
@@ -2450,7 +2589,7 @@ def admin_user():
     return jsonify({'ok': True, 'user': u})
 
 @app.post('/api/admin/user-password')
-@admin_auth
+@admin_session_auth
 def admin_user_password():
     d = request.get_json(force=True, silent=True) or {}
     try: uid = int(d.get('user_id') or 0)
@@ -2466,7 +2605,7 @@ def admin_user_password():
     return jsonify({'ok': True})
 
 @app.post('/api/admin/user-pin')
-@admin_auth
+@admin_session_auth
 def admin_user_pin():
     """Admin sets a user's 4-digit transaction PIN (forgotten / never set).
     Also clears any PIN lockout from wrong attempts. Sessions are NOT
@@ -2490,7 +2629,7 @@ def admin_user_pin():
     return jsonify({'ok': True})
 
 @app.post('/api/admin/transaction-resolve')
-@admin_auth
+@admin_session_auth
 def admin_transaction_resolve():
     """Resolve a transaction stuck in 'pending' (e.g. the buy request died
     after debit, before settle). The admin states the outcome proven from
@@ -2529,7 +2668,7 @@ def admin_transaction_resolve():
     return jsonify({'ok': True, 'wallet': float(bal[0]['wallet']) if bal else None})
 
 @app.delete('/api/admin/user')
-@admin_auth
+@admin_session_auth
 def admin_user_delete():
     d = request.get_json(force=True, silent=True) or {}
     try: uid = int(d.get('user_id') or 0)
@@ -2552,13 +2691,13 @@ def announcements_public():
         "WHERE active=1 ORDER BY id DESC LIMIT 20")})
 
 @app.get('/api/admin/announcements')
-@admin_auth
+@admin_session_auth
 def admin_announcements():
     return jsonify({'ok': True, 'announcements': q(
         "SELECT * FROM announcements ORDER BY id DESC LIMIT 100")})
 
 @app.post('/api/admin/announcements')
-@admin_auth
+@admin_session_auth
 def admin_announcement_create():
     d = request.get_json(force=True, silent=True) or {}
     title = (d.get('title') or '').strip()[:120]
@@ -2571,7 +2710,7 @@ def admin_announcement_create():
     return jsonify({'ok': True})
 
 @app.post('/api/admin/announcements/toggle')
-@admin_auth
+@admin_session_auth
 def admin_announcement_toggle():
     d = request.get_json(force=True, silent=True) or {}
     try: aid = int(d.get('id') or 0)
@@ -2585,7 +2724,7 @@ def admin_announcement_toggle():
     return jsonify({'ok': True, 'active': new})
 
 @app.delete('/api/admin/announcements')
-@admin_auth
+@admin_session_auth
 def admin_announcement_delete():
     d = request.get_json(force=True, silent=True) or {}
     try: aid = int(d.get('id') or 0)
@@ -2596,8 +2735,74 @@ def admin_announcement_delete():
     log_admin('announcement', f'deleted announcement {aid}')
     return jsonify({'ok': True})
 
-@app.get('/api/admin/logs')
+@app.post('/api/admin/request-code')
 @admin_auth
+@limiter.limit('3 per minute')
+def admin_request_code():
+    """Step 1 of admin sign-in: key already checked by admin_auth.
+    Sends a 6-digit code (15-min expiry) to the admin inbox."""
+    to = admin_email()
+    if not to:
+        return jsonify({'ok': False, 'error': 'Admin email is not set. Set ADMIN_EMAIL on the server.'}), 400
+    code = str(secrets.randbelow(900000) + 100000)
+    chash = hashlib.sha256(code.encode()).hexdigest()
+    exp = (datetime.now(LAGOS) + timedelta(minutes=15)).isoformat(timespec='seconds')
+    run("DELETE FROM admin_codes")
+    run("INSERT INTO admin_codes(code_hash,expires_at,created) VALUES(?,?,?)",
+        (chash, exp, now_iso()))
+    sent = send_email(to, 'Your Panther Data admin sign-in code',
+        f"Hello,\n\nYour Panther Data admin sign-in code is:\n\n{code}\n\n"
+        f"Enter this code to open the admin area. It expires in 15 minutes.\n\n"
+        f"If you did not try to sign in, change the admin key immediately.\n\n— Panther Data")
+    return jsonify({'ok': True, 'email_sent': bool(sent)})
+
+@app.post('/api/admin/verify-code')
+@admin_auth
+@limiter.limit('10 per minute')
+def admin_verify_code():
+    """Step 2 of admin sign-in: key + code -> session token. The raw key
+    is never enough on its own for any other admin endpoint."""
+    d = request.get_json(force=True)
+    code = str(d.get('code') or '').strip()
+    remember = bool(d.get('remember'))
+    rows = q("SELECT * FROM admin_codes ORDER BY id DESC LIMIT 1")
+    chash = hashlib.sha256(code.encode()).hexdigest()
+    if not rows or rows[0]['code_hash'] != chash:
+        return jsonify({'ok': False, 'error': 'Wrong code. Check the email and try again.'}), 400
+    if rows[0]['expires_at'] < now_iso():
+        return jsonify({'ok': False, 'error': 'Code expired. Request a new one.'}), 400
+    run("DELETE FROM admin_codes")
+    tok, exp = new_admin_session(remember)
+    log_admin('admin_login', 'admin signed in with key + code')
+    return jsonify({'ok': True, 'admin_session': tok, 'expires_at': exp})
+
+@app.post('/api/admin/logout')
+@admin_session_auth
+def admin_logout():
+    tok = (request.headers.get('X-Admin-Session') or '').strip()
+    run("DELETE FROM admin_sessions WHERE token=?", (tok,))
+    return jsonify({'ok': True})
+
+@app.post('/api/admin/user-login-2fa')
+@admin_session_auth
+def admin_user_login_2fa():
+    """Admin's way out for a customer who lost access to their email:
+    switch that customer's sign-in codes off (or back on). Logged."""
+    d = request.get_json(force=True)
+    try: uid = int(d.get('user_id') or 0)
+    except: uid = 0
+    enabled = bool(d.get('enabled'))
+    if not q("SELECT id FROM users WHERE id=?", (uid,)):
+        return jsonify({'ok': False, 'error': 'User not found.'}), 404
+    try:
+        run("UPDATE users SET login_2fa=? WHERE id=?", (1 if enabled else 0, uid))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Please try again in a minute.'}), 503
+    log_admin('login_2fa', f'user {uid} sign-in codes -> {1 if enabled else 0} (by admin)')
+    return jsonify({'ok': True, 'login_2fa': enabled})
+
+@app.get('/api/admin/logs')
+@admin_session_auth
 def admin_logs():
     return jsonify({'ok': True, 'logs': q(
         "SELECT * FROM admin_logs ORDER BY id DESC LIMIT 200")})
