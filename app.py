@@ -25,6 +25,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 # ---------------- config ----------------
 ADMIN_KEY       = os.environ.get('ADMIN_KEY', '')
+BACKUP_KEY      = os.environ.get('BACKUP_KEY', '')
 DATABASE_URL    = os.environ.get('DATABASE_URL', '')
 FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', '*')
 SMTP_USER         = os.environ.get('SMTP_USER', '')
@@ -525,6 +526,30 @@ def admin_session_auth(f):
             return jsonify({'ok': False, 'error': 'Admin session expired. Sign in again.'}), 403
         run("UPDATE admin_sessions SET last_seen=? WHERE token=?", (now, tok))
         return f(*a, **kw)
+    return wrapper
+
+def admin_export_auth(f):
+    """Read-only export endpoints ONLY (users, transactions, prices, user
+    detail — the four the daily backup script pulls). Accepts either a
+    verified admin session (same as admin_session_auth) or the separate
+    BACKUP_KEY, which works on these four endpoints and nowhere else:
+    it cannot adjust wallets, change prices or settings, reset passwords
+    or PINs, delete users, or open the admin page. The admin key + code
+    login is unchanged, and customer sign-in is untouched."""
+    @wraps(f)
+    def wrapper(*a, **kw):
+        tok = (request.headers.get('X-Admin-Session') or '').strip()
+        if tok:
+            rows = q("SELECT expires_at FROM admin_sessions WHERE token=?", (tok,))
+            if rows:
+                now = now_iso()
+                if not rows[0].get('expires_at') or rows[0]['expires_at'] >= now:
+                    run("UPDATE admin_sessions SET last_seen=? WHERE token=?", (now, tok))
+                    return f(*a, **kw)
+        bkey = (request.headers.get('X-Backup-Key') or '').strip()
+        if BACKUP_KEY and bkey and bkey == BACKUP_KEY:
+            return f(*a, **kw)
+        return jsonify({'ok': False, 'error': 'Admin session required. Sign in again.'}), 403
     return wrapper
 
 def get_user(uid):
@@ -2334,7 +2359,7 @@ def bilal_requery():
     return jsonify({'ok': True, 'status': tstatus or 'pending'})
 
 @app.get('/api/admin/users')
-@admin_session_auth
+@admin_export_auth
 def admin_users():
     return jsonify({'ok': True, 'users': q(
         "SELECT id,name,username,phone,email,email_verified,wallet,created FROM users ORDER BY id DESC LIMIT 500")})
@@ -2361,14 +2386,14 @@ def admin_wallet():
     return jsonify({'ok': True})
 
 @app.get('/api/admin/transactions')
-@admin_session_auth
+@admin_export_auth
 def admin_txs():
     return jsonify({'ok': True, 'transactions': q(
         """SELECT t.*, u.phone FROM transactions t LEFT JOIN users u ON u.id=t.user_id
            ORDER BY t.id DESC LIMIT 500""")})
 
 @app.get('/api/admin/prices')
-@admin_session_auth
+@admin_export_auth
 def admin_prices():
     return jsonify({'ok': True, 'prices': q("SELECT * FROM plan_prices ORDER BY label")})
 
@@ -2566,7 +2591,7 @@ def reset_password():
 
 # ---------------- admin: user detail / password / delete ----------------
 @app.get('/api/admin/user')
-@admin_session_auth
+@admin_export_auth
 def admin_user():
     try: uid = int(request.args.get('id') or 0)
     except Exception: uid = 0
