@@ -333,6 +333,11 @@ def init_db():
         """CREATE TABLE IF NOT EXISTS bilal_discos(
              disco_key TEXT PRIMARY KEY, bilal_id TEXT, label TEXT, updated TEXT)""",
         """CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT, updated_at TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS admin_logs(
+             id {auto}, action TEXT, detail TEXT, created TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS announcements(
+             id {auto}, title TEXT, body TEXT, audience TEXT DEFAULT 'all',
+             active INTEGER DEFAULT 1, created TEXT)""",
     ]
     for s in stmts:
         run(s)
@@ -467,6 +472,15 @@ def admin_auth(f):
             return jsonify({'ok': False, 'error': 'Admin key required.'}), 403
         return f(*a, **kw)
     return wrapper
+
+def log_admin(action, detail=''):
+    """Append one line to the server activity log. Never raises: logging
+    must never break the admin action it records."""
+    try:
+        run("INSERT INTO admin_logs(action,detail,created) VALUES(?,?,?)",
+            (action, (detail or '')[:500], now_iso()))
+    except Exception:
+        pass
 
 def get_user(uid):
     rows = q("SELECT id,name,username,phone,email,wallet,email_verified,created,monnify_ref,monnify_acct,monnify_bank,monnify_acct_name FROM users WHERE id=?", (uid,))
@@ -2034,6 +2048,7 @@ def bilal_plan_save():
            network=excluded.network, name=excluded.name, cost=excluded.cost,
            sell=excluded.sell, updated=excluded.updated""",
         (plan_id, service, network, name, cost, sell, now_iso()))
+    log_admin('price_save', f'Bilal {service}/{network} {name}: cost {cost}, sell {sell}')
     return jsonify({'ok': True})
 
 @app.get('/api/admin/bilal-discos')
@@ -2189,7 +2204,7 @@ def bilal_requery():
 @admin_auth
 def admin_users():
     return jsonify({'ok': True, 'users': q(
-        "SELECT id,name,phone,email,email_verified,wallet,created FROM users ORDER BY id DESC LIMIT 500")})
+        "SELECT id,name,username,phone,email,email_verified,wallet,created FROM users ORDER BY id DESC LIMIT 500")})
 
 @app.post('/api/admin/wallet')
 @admin_auth
@@ -2199,14 +2214,17 @@ def admin_wallet():
     try: amount = float(d.get('amount') or 0)
     except: amount = 0
     action = d.get('action', 'add')
+    note = (d.get('note') or '').strip()[:200]
     rows = q("SELECT id FROM users WHERE phone=?", (phone,))
     if not rows: return jsonify({'ok': False, 'error': 'User not found.'}), 404
     delta = amount if action == 'add' else -amount
     run("UPDATE users SET wallet=wallet+? WHERE phone=?", (delta, phone))
+    desc = f'Admin wallet adjustment ({action})' + (f' — {note}' if note else '')
     run("""INSERT INTO transactions(user_id,type,service,description,amount,direction,
            status,reference,created) VALUES(?, 'fund','admin',?,?, 'in','successful',?,?)""",
-        (rows[0]['id'], f'Admin wallet adjustment', amount,
+        (rows[0]['id'], desc, amount,
          'SVA' + secrets.token_hex(5).upper(), now_iso()))
+    log_admin('wallet_adjust', f'{action} {amount} for {phone}' + (f' — {note}' if note else ''))
     return jsonify({'ok': True})
 
 @app.get('/api/admin/transactions')
@@ -2308,6 +2326,7 @@ def admin_settings_save():
            ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at""",
         (key, value, now_iso()))
     SETTINGS[key] = value
+    log_admin('setting_save', key)
     # Monnify caches its OAuth token per key-set; a key change must re-auth.
     if key.startswith('MONNIFY_'):
         _monnify['token'] = None
@@ -2418,7 +2437,7 @@ def reset_password():
 def admin_user():
     try: uid = int(request.args.get('id') or 0)
     except Exception: uid = 0
-    rows = q("SELECT id,name,phone,email,email_verified,wallet,created,"
+    rows = q("SELECT id,name,username,phone,email,email_verified,wallet,created,"
              "monnify_ref,monnify_acct,monnify_bank,monnify_acct_name "
              "FROM users WHERE id=?", (uid,))
     if not rows:
@@ -2443,6 +2462,7 @@ def admin_user_password():
         return jsonify({'ok': False, 'error': 'User not found.'}), 404
     run("UPDATE users SET pass_hash=? WHERE id=?", (generate_password_hash(pw), uid))
     run("DELETE FROM tokens WHERE user_id=?", (uid,))
+    log_admin('user_password', f'user {uid} password reset by admin')
     return jsonify({'ok': True})
 
 @app.post('/api/admin/user-pin')
@@ -2466,6 +2486,7 @@ def admin_user_pin():
             (generate_password_hash(pin), uid))
     else:
         run("UPDATE users SET tx_pin_hash=? WHERE id=?", (generate_password_hash(pin), uid))
+    log_admin('user_pin', f'user {uid} PIN reset by admin')
     return jsonify({'ok': True})
 
 @app.post('/api/admin/transaction-resolve')
@@ -2504,6 +2525,7 @@ def admin_transaction_resolve():
     finally:
         if not USE_PG: con.close()
     bal = q("SELECT wallet FROM users WHERE id=?", (t['user_id'],))
+    log_admin('tx_resolve', f'{ref} -> {outcome}')
     return jsonify({'ok': True, 'wallet': float(bal[0]['wallet']) if bal else None})
 
 @app.delete('/api/admin/user')
@@ -2518,7 +2540,67 @@ def admin_user_delete():
     run("DELETE FROM tokens WHERE user_id=?", (uid,))
     run("DELETE FROM email_codes WHERE user_id=?", (uid,))
     run("DELETE FROM users WHERE id=?", (uid,))
+    log_admin('user_delete', f'user {uid} deleted by admin')
     return jsonify({'ok': True})
+
+# ---------------- admin: announcements + activity log (Admin v2) ----------------
+@app.get('/api/announcements')
+def announcements_public():
+    """Active announcements for the shop app (no admin key needed)."""
+    return jsonify({'ok': True, 'announcements': q(
+        "SELECT id,title,body,audience,created FROM announcements "
+        "WHERE active=1 ORDER BY id DESC LIMIT 20")})
+
+@app.get('/api/admin/announcements')
+@admin_auth
+def admin_announcements():
+    return jsonify({'ok': True, 'announcements': q(
+        "SELECT * FROM announcements ORDER BY id DESC LIMIT 100")})
+
+@app.post('/api/admin/announcements')
+@admin_auth
+def admin_announcement_create():
+    d = request.get_json(force=True, silent=True) or {}
+    title = (d.get('title') or '').strip()[:120]
+    body = (d.get('body') or '').strip()[:1000]
+    if not title or not body:
+        return jsonify({'ok': False, 'error': 'Title and message are required.'}), 400
+    run("INSERT INTO announcements(title,body,audience,active,created) VALUES(?,?,?,?,?)",
+        (title, body, 'all', 1, now_iso()))
+    log_admin('announcement', f'posted: {title}')
+    return jsonify({'ok': True})
+
+@app.post('/api/admin/announcements/toggle')
+@admin_auth
+def admin_announcement_toggle():
+    d = request.get_json(force=True, silent=True) or {}
+    try: aid = int(d.get('id') or 0)
+    except Exception: aid = 0
+    rows = q("SELECT active FROM announcements WHERE id=?", (aid,))
+    if not rows:
+        return jsonify({'ok': False, 'error': 'Announcement not found.'}), 404
+    new = 0 if rows[0]['active'] else 1
+    run("UPDATE announcements SET active=? WHERE id=?", (new, aid))
+    log_admin('announcement', f"{'hid' if new == 0 else 'showed'} announcement {aid}")
+    return jsonify({'ok': True, 'active': new})
+
+@app.delete('/api/admin/announcements')
+@admin_auth
+def admin_announcement_delete():
+    d = request.get_json(force=True, silent=True) or {}
+    try: aid = int(d.get('id') or 0)
+    except Exception: aid = 0
+    if not q("SELECT id FROM announcements WHERE id=?", (aid,)):
+        return jsonify({'ok': False, 'error': 'Announcement not found.'}), 404
+    run("DELETE FROM announcements WHERE id=?", (aid,))
+    log_admin('announcement', f'deleted announcement {aid}')
+    return jsonify({'ok': True})
+
+@app.get('/api/admin/logs')
+@admin_auth
+def admin_logs():
+    return jsonify({'ok': True, 'logs': q(
+        "SELECT * FROM admin_logs ORDER BY id DESC LIMIT 200")})
 
 @app.get('/')
 def index():
