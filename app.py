@@ -346,6 +346,11 @@ def init_db():
              token TEXT PRIMARY KEY, created TEXT, expires_at TEXT, last_seen TEXT)""",
         f"""CREATE TABLE IF NOT EXISTS admin_codes(
              id {auto}, code_hash TEXT, expires_at TEXT, created TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS invoice_fundings(
+             id {auto}, reference TEXT UNIQUE, user_id INTEGER,
+             amount REAL, account_number TEXT, bank_name TEXT, bank_code TEXT,
+             account_name TEXT, checkout_url TEXT, expiry TEXT,
+             status TEXT DEFAULT 'PENDING', created TEXT, paid_at TEXT)""",
     ]
     for s in stmts:
         run(s)
@@ -1441,7 +1446,38 @@ def monnify_webhook():
             uid = rows[0]['id']
             break
     if not uid:
-        # Not one of our reserved accounts (or reservation unknown here).
+        # Not a permanent reserved account — try a one-time invoice payment.
+        # Resolve ONLY by exact match of a server-generated invoice reference
+        # (never by parsing a user ID out of any field).
+        inv_ref = None
+        inv = None
+        for cand in [str(ev.get('invoiceReference') or '').strip(),
+                     str(prod.get('invoiceReference') or '').strip(),
+                     str(prod.get('reference') or '').strip(),
+                     str(ev.get('accountReference') or '').strip(),
+                     str(prod.get('accountReference') or '').strip()]:
+            if not cand:
+                continue
+            irows = q("SELECT user_id, amount, status FROM invoice_fundings WHERE reference=?",
+                      (cand,))
+            if irows:
+                inv_ref = cand
+                inv = irows[0]
+                break
+        if inv_ref and inv.get('status') != 'PAID':
+            tx_ref = str(ev.get('transactionReference') or '') or ('INV-' + inv_ref)
+            try:
+                amount = float(ev.get('amountPaid') or 0)
+            except Exception:
+                amount = 0
+            if amount <= 0:
+                amount = float(inv.get('amount') or 0)
+            if amount > 0:
+                res = credit_wallet_atomic(inv['user_id'], amount, tx_ref,
+                                           'Wallet funding via one-time account')
+                if res in ('ok', 'duplicate'):
+                    run("UPDATE invoice_fundings SET status='PAID', paid_at=? WHERE reference=?",
+                        (now_iso(), inv_ref))
         return jsonify({'ok': True})
     tx_ref = str(ev.get('transactionReference') or '')
     try:
@@ -1521,6 +1557,115 @@ def fund_sync():
     return jsonify({'ok': True, 'credited': credited,
                     'new_transactions': count, 'balance': bal,
                     'recent_funding': recent})
+
+# ---------------- one-time invoice funding (no BVN/NIN) ----------------
+# Monnify dynamic invoices: each invoice gets its own virtual account that
+# needs NO BVN or NIN (unlike permanent reserved accounts, which CBN rules
+# tie to a BVN/NIN). The account is for this payment only and expires with
+# the invoice. Crediting is idempotent: one credit per invoice, via the
+# transactions.reference UNIQUE key, whether the money is confirmed by the
+# webhook or by the customer's check-now tap. A row is only marked PAID
+# after a successful credit, so a failed credit can always be retried.
+
+def _invoice_expiry():
+    # Monnify wants 'yyyy-MM-dd HH:mm:ss'; a day is plenty for one transfer.
+    return (datetime.now(timezone.utc) + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+
+@app.post('/api/fund/invoice')
+@limiter.limit('20 per minute')
+@auth
+def fund_invoice():
+    """Create a one-time Monnify invoice account for this user. No BVN/NIN."""
+    if not monnify_configured():
+        return jsonify({'ok': False, 'error': 'Bank funding is not set up yet. Try again later.'}), 503
+    d = request.get_json(force=True, silent=True) or {}
+    try:
+        amount = int(d.get('amount') or 0)
+    except Exception:
+        amount = 0
+    if amount < 100:
+        return jsonify({'ok': False, 'error': 'Minimum funding is ₦100.'}), 400
+    user = get_user(g.user_id)
+    ref = 'PDI' + uuid.uuid4().hex[:20]
+    expiry = _invoice_expiry()
+    try:
+        tok = monnify_token()
+        r = requests.post(
+            f'{monnify_base()}/api/v1/invoice/create',
+            headers={'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'},
+            json={'amount': amount,
+                  'invoiceReference': ref,
+                  'description': 'Panther Data wallet funding',
+                  'currencyCode': 'NGN',
+                  'contractCode': S('MONNIFY_CONTRACT_CODE'),
+                  'customerEmail': user.get('email'),
+                  'customerName': user.get('name'),
+                  'expiryDate': expiry,
+                  'paymentMethods': ['ACCOUNT_TRANSFER'],
+                  'apiKey': S('MONNIFY_API_KEY')},
+            timeout=30).json()
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Could not reach Monnify. Try again.'}), 502
+    body = r.get('responseBody') or {}
+    if not r.get('requestSuccessful') or not body.get('accountNumber'):
+        return jsonify({'ok': False,
+                        'error': 'Monnify error: ' + str(r.get('responseMessage') or 'try again')}), 502
+    run("""INSERT INTO invoice_fundings(reference,user_id,amount,account_number,
+             bank_name,bank_code,account_name,checkout_url,expiry,status,created)
+             VALUES(?,?,?,?,?,?,?,?,?,'PENDING',?)""",
+        (ref, g.user_id, amount, body.get('accountNumber'), body.get('bankName'),
+         body.get('bankCode'), body.get('accountName'), body.get('checkoutUrl'),
+         body.get('expiryDate') or expiry, now_iso()))
+    return jsonify({'ok': True, 'reference': ref, 'amount': amount,
+                    'account_number': body.get('accountNumber'),
+                    'bank_name': body.get('bankName'),
+                    'bank_code': body.get('bankCode'),
+                    'account_name': body.get('accountName'),
+                    'expiry': body.get('expiryDate') or expiry})
+
+@app.post('/api/fund/invoice-check')
+@limiter.limit('20 per minute')
+@auth
+def fund_invoice_check():
+    """Check whether a one-time invoice was paid; credit once if so."""
+    d = request.get_json(force=True, silent=True) or {}
+    ref = (d.get('reference') or '').strip()
+    rows = q("SELECT * FROM invoice_fundings WHERE reference=? AND user_id=?",
+             (ref, g.user_id)) if ref else []
+    if not rows:
+        return jsonify({'ok': False, 'error': 'Invoice not found.'}), 404
+    inv = rows[0]
+    if inv.get('status') == 'PAID':
+        return jsonify({'ok': True, 'paid': True,
+                        'balance': get_user(g.user_id).get('wallet', 0)})
+    if not monnify_configured():
+        return jsonify({'ok': False, 'error': 'Bank funding is not set up yet. Try again later.'}), 503
+    try:
+        tok = monnify_token()
+        r = requests.get(
+            f'{monnify_base()}/api/v1/invoice/{ref}/details',
+            headers={'Authorization': f'Bearer {tok}'}, timeout=30).json()
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Could not reach Monnify. Try again.'}), 502
+    body = r.get('responseBody') or {}
+    status = (body.get('invoiceStatus') or '').upper()
+    if status == 'PAID':
+        res = credit_wallet_atomic(g.user_id, inv['amount'], 'INV-' + ref,
+                                   'Wallet funding via one-time account')
+        if res == 'error':
+            return jsonify({'ok': False,
+                            'error': 'Could not credit wallet. Tap check again.'}), 502
+        run("UPDATE invoice_fundings SET status='PAID', paid_at=? WHERE reference=?",
+            (now_iso(), ref))
+        return jsonify({'ok': True, 'paid': True, 'credited': res == 'ok',
+                        'balance': get_user(g.user_id).get('wallet', 0)})
+    if status == 'EXPIRED':
+        run("UPDATE invoice_fundings SET status='EXPIRED' WHERE reference=?", (ref,))
+        return jsonify({'ok': True, 'paid': False, 'expired': True})
+    if not r.get('requestSuccessful'):
+        return jsonify({'ok': False,
+                        'error': 'Monnify error: ' + str(r.get('responseMessage') or 'try again')}), 502
+    return jsonify({'ok': True, 'paid': False})
 
 # ---------------- VTpass services ----------------
 NETWORKS = {'mtn': 'mtn', 'glo': 'glo', 'airtel': 'airtel', 'etisalat': 'etisalat'}
