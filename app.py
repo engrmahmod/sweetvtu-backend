@@ -368,9 +368,12 @@ def init_db():
     # can never resurrect access that the main admin revoked.
     # NOTE: now_iso() is defined below init_db(), so the seed uses a
     # plain UTC timestamp here instead of calling it.
+    # NOTE 2: ON CONFLICT DO NOTHING works on both Postgres (live Neon)
+    # and SQLite (scratch tests). INSERT OR IGNORE is SQLite-only and
+    # silently failed on Postgres, which left the seed row missing live.
     try:
-        run("""INSERT OR IGNORE INTO staff_users(email,role,active,created)
-               VALUES(?,?,?,?)""",
+        run("""INSERT INTO staff_users(email,role,active,created)
+               VALUES(?,?,?,?) ON CONFLICT(email) DO NOTHING""",
             ('pantherdata1@gmail.com', 'full', 1,
              datetime.now(timezone.utc).isoformat(timespec='seconds')))
     except Exception:
