@@ -730,7 +730,7 @@ def admin_export_auth(f):
 
 def get_user(uid):
     try:
-        rows = q("SELECT id,name,username,phone,email,wallet,email_verified,created,monnify_ref,monnify_acct,monnify_bank,monnify_acct_name,login_2fa FROM users WHERE id=?", (uid,))
+        rows = q("SELECT id,name,username,phone,email,wallet,email_verified,created,monnify_ref,monnify_acct,monnify_bank,monnify_acct_name,xpouch_ref,xpouch_acct,xpouch_bank,xpouch_acct_name,login_2fa FROM users WHERE id=?", (uid,))
     except Exception:
         # Column not migrated yet (migration pending): fall back without it.
         rows = q("SELECT id,name,username,phone,email,wallet,email_verified,created,monnify_ref,monnify_acct,monnify_bank,monnify_acct_name FROM users WHERE id=?", (uid,))
@@ -1250,7 +1250,8 @@ def config():
                     'email_via': 'brevo' if S('BREVO_API_KEY') else 'smtp',
                     'email_ready': bool(S('BREVO_API_KEY') or (SMTP_USER and SMTP_APP_PASSWORD)),
                     'monnify_ready': monnify_configured(),
-                    'fund_method': 'monnify'})
+                    'xpouch_ready': xpouch_configured(),
+                    'fund_method': funding_provider()})
 
 @app.get('/api/ping')
 def ping():
