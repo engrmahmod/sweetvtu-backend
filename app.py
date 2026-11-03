@@ -3336,8 +3336,8 @@ def admin_settings_save():
     value = '' if value is None else str(value)
     if key.endswith('_SANDBOX') and value not in ('0', '1'):
         return jsonify({'ok': False, 'error': 'Sandbox must be 0 or 1.'}), 400
-    if key == 'PROVIDER' and value not in ('vtpass', 'fatizara', 'bilal'):
-        return jsonify({'ok': False, 'error': 'Provider must be vtpass, fatizara or bilal.'}), 400
+    if key == 'PROVIDER' and value not in ('vtpass', 'fatizara', 'bilal', 'legitdataway'):
+        return jsonify({'ok': False, 'error': 'Provider must be vtpass, fatizara, bilal or legitdataway.'}), 400
     run("""INSERT INTO settings(k,v,updated_at) VALUES(?,?,?)
            ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at""",
         (key, value, now_iso()))
@@ -3378,6 +3378,16 @@ def admin_test_connection():
             try:
                 _, auth_resp = bilal_token()
                 return jsonify({'ok': True, 'detail': f"Auth OK — wallet balance ₦{auth_resp.get('balance')}."})
+            except Exception as e:
+                return jsonify({'ok': False, 'detail': 'Auth failed: ' + str(e)[:120]})
+        if service == 'legitdataway':
+            if not legitdataway_configured():
+                return jsonify({'ok': False, 'detail': 'LegitDataWay username / password missing.'})
+            try:
+                _, auth_resp = legitdataway_token()
+                bal = auth_resp.get('balance')
+                detail = f"Auth OK — wallet balance ₦{bal}." if bal is not None else 'Auth OK.'
+                return jsonify({'ok': True, 'detail': detail})
             except Exception as e:
                 return jsonify({'ok': False, 'detail': 'Auth failed: ' + str(e)[:120]})
         if service == 'monnify':
