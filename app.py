@@ -2338,6 +2338,7 @@ def buy_airtime():
     if net not in NETWORKS: return jsonify({'ok': False, 'error': 'Choose a network.'}), 400
     if not re.match(r'^0\d{10}$', phone): return jsonify({'ok': False, 'error': 'Enter a valid 11-digit phone number.'}), 400
     if amount < 50: return jsonify({'ok': False, 'error': 'Minimum airtime is ₦50.'}), 400
+    if amount > 50000: return jsonify({'ok': False, 'error': 'Maximum airtime is ₦50,000.'}), 400
     if provider() == 'fatizara':
         if not fatizara_configured():
             return jsonify({'ok': False, 'error': 'Fatizara is not set up yet.'}), 503
