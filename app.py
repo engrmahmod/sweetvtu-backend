@@ -9,7 +9,7 @@ Env vars:
   SMTP_USER             (Gmail address used to send verification codes, e.g. sweetvtu@gmail.com)
   SMTP_APP_PASSWORD     (Gmail *app password*, not the login password)
   SMTP_FROM_NAME        (sender name shown on emails, default Panther Data)
-Provider keys (VTPASS_*, MONNIFY_*, BREVO_*, PAYSTACK_*) are seeded from env
+Provider keys (VTPASS_*, BREVO_*, PAYSTACK_*) are seeded from env
 into the settings table at startup, then editable from the admin panel.
   PORT
 """
@@ -51,13 +51,9 @@ SETTINGS_META = {
     'FUNDING_PROVIDER':   dict(group='Provider', label='Funding provider — monnify or xpouch', secret=False),
     'LEGITDATAWAY_USERNAME': dict(group='LegitDataWay', label='LegitDataWay username', secret=True),
     'LEGITDATAWAY_PASSWORD': dict(group='LegitDataWay', label='LegitDataWay password', secret=True),
-    'MONNIFY_API_KEY':    dict(group='Monnify',  label='API Key',      secret=True),
-    'MONNIFY_SECRET_KEY': dict(group='Monnify',  label='Secret Key',   secret=True),
-    'MONNIFY_CONTRACT_CODE': dict(group='Monnify', label='Contract Code', secret=True),
     'XPOUCH_API_KEY':     dict(group='Xpouch',   label='API Key',      secret=True),
     'XPOUCH_SECRET':      dict(group='Xpouch',   label='API Secret',   secret=True),
     'XPOUCH_SANDBOX':     dict(group='Xpouch',   label='Sandbox mode — 1 = test, 0 = LIVE', secret=True),
-    'MONNIFY_SANDBOX':    dict(group='Monnify',  label='Sandbox mode — 1 = test, 0 = LIVE', secret=False),
     'BREVO_API_KEY':      dict(group='Email',    label='Brevo API Key', secret=True),
     'BREVO_SENDER':       dict(group='Email',    label='Sender email', secret=False),
     'PAYSTACK_SECRET_KEY': dict(group='Paystack', label='Secret Key',  secret=True),
@@ -339,6 +335,28 @@ def _start_migration_retry_thread():
     except Exception:
         pass
 
+def _purge_monnify_data():
+    """Delete every stored Monnify detail (2026-11-03, Mahmod's call, after
+    Xpouch funding proved live): all customers' stored Monnify account
+    numbers/banks/references, and the Monnify settings values. The rows
+    stay (emptied, not deleted) so the env seeder can never re-fill them
+    from old Render env vars, and the columns stay so old code paths and
+    backups keep working. Transaction history is NEVER touched. Idempotent:
+    re-running it on an already-purged database changes nothing."""
+    try:
+        run("""UPDATE users SET monnify_ref=NULL, monnify_acct=NULL,
+               monnify_bank=NULL, monnify_acct_name=NULL
+               WHERE monnify_ref IS NOT NULL OR monnify_acct IS NOT NULL
+               OR monnify_bank IS NOT NULL OR monnify_acct_name IS NOT NULL""")
+    except Exception:
+        pass
+    try:
+        run("""UPDATE settings SET v='' WHERE k IN
+               ('MONNIFY_API_KEY','MONNIFY_SECRET_KEY','MONNIFY_CONTRACT_CODE',
+                'MONNIFY_SANDBOX') AND v <> ''""")
+    except Exception:
+        pass
+
 def init_db():
     auto = "SERIAL PRIMARY KEY" if USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
     stmts = [
@@ -475,6 +493,9 @@ def init_db():
         run("CREATE UNIQUE INDEX IF NOT EXISTS users_monnify_ref_uniq ON users(monnify_ref)")
     except Exception:
         pass
+    # Monnify is deleted (2026-11-03): purge any stored Monnify account
+    # numbers and settings values. Transaction history is untouched.
+    _purge_monnify_data()
     # Each Xpouch account reference must belong to exactly one user, same rule.
     try:
         run("CREATE UNIQUE INDEX IF NOT EXISTS users_xpouch_ref_uniq ON users(xpouch_ref)")
@@ -508,10 +529,6 @@ def load_settings():
         'FATIZARA_PASSWORD': os.environ.get('FATIZARA_PASSWORD', ''),
         'BILAL_USERNAME': os.environ.get('BILAL_USERNAME', ''),
         'BILAL_PASSWORD': os.environ.get('BILAL_PASSWORD', ''),
-        'MONNIFY_API_KEY': os.environ.get('MONNIFY_API_KEY', '').strip(),
-        'MONNIFY_SECRET_KEY': os.environ.get('MONNIFY_SECRET_KEY', '').strip(),
-        'MONNIFY_CONTRACT_CODE': os.environ.get('MONNIFY_CONTRACT_CODE', '').strip(),
-        'MONNIFY_SANDBOX': os.environ.get('MONNIFY_SANDBOX', '1'),
         'XPOUCH_API_KEY': os.environ.get('XPOUCH_API_KEY', '').strip(),
         'XPOUCH_SECRET': os.environ.get('XPOUCH_SECRET', '').strip(),
         'XPOUCH_SANDBOX': os.environ.get('XPOUCH_SANDBOX', '1'),
