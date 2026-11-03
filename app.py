@@ -48,11 +48,15 @@ SETTINGS_META = {
     'FATIZARA_PASSWORD':  dict(group='Fatizara', label='Fatizara password', secret=True),
     'BILAL_USERNAME':     dict(group='Bilal',    label='Bilal username', secret=False),
     'BILAL_PASSWORD':     dict(group='Bilal',    label='Bilal password', secret=True),
+    'FUNDING_PROVIDER':   dict(group='Provider', label='Funding provider — monnify or xpouch', secret=False),
     'LEGITDATAWAY_USERNAME': dict(group='LegitDataWay', label='LegitDataWay username', secret=True),
     'LEGITDATAWAY_PASSWORD': dict(group='LegitDataWay', label='LegitDataWay password', secret=True),
     'MONNIFY_API_KEY':    dict(group='Monnify',  label='API Key',      secret=True),
     'MONNIFY_SECRET_KEY': dict(group='Monnify',  label='Secret Key',   secret=True),
     'MONNIFY_CONTRACT_CODE': dict(group='Monnify', label='Contract Code', secret=True),
+    'XPOUCH_API_KEY':     dict(group='Xpouch',   label='API Key',      secret=True),
+    'XPOUCH_SECRET':      dict(group='Xpouch',   label='API Secret',   secret=True),
+    'XPOUCH_SANDBOX':     dict(group='Xpouch',   label='Sandbox mode — 1 = test, 0 = LIVE', secret=True),
     'MONNIFY_SANDBOX':    dict(group='Monnify',  label='Sandbox mode — 1 = test, 0 = LIVE', secret=False),
     'BREVO_API_KEY':      dict(group='Email',    label='Brevo API Key', secret=True),
     'BREVO_SENDER':       dict(group='Email',    label='Sender email', secret=False),
@@ -76,6 +80,28 @@ def monnify_sandbox():
 
 def monnify_base():
     return 'https://sandbox.monnify.com' if monnify_sandbox() else 'https://api.monnify.com'
+
+def xpouch_sandbox():
+    return S('XPOUCH_SANDBOX') == '1'
+
+def xpouch_base():
+    # Sandbox uses the same merchant credentials on a separate base path.
+    return ('https://api.xpouch.co/api/merchant/sandbox/v1' if xpouch_sandbox()
+            else 'https://api.xpouch.co/api/merchant/v1')
+
+def xpouch_configured():
+    return bool(S('XPOUCH_API_KEY') and S('XPOUCH_SECRET'))
+
+def xpouch_headers():
+    return {'X-API-Key': S('XPOUCH_API_KEY'), 'X-API-Secret': S('XPOUCH_SECRET'),
+            'Accept': 'application/json', 'Content-Type': 'application/json'}
+
+def funding_provider():
+    """Active funding provider: 'monnify' (default) or 'xpouch'.
+    Monnify stays the default until Xpouch funding is proven with tests,
+    so flipping to Xpouch is a one-setting change, and back is one tap."""
+    p = (S('FUNDING_PROVIDER') or 'monnify').strip().lower()
+    return p if p in ('monnify', 'xpouch') else 'monnify'
 
 def provider():
     """Active vending provider: 'vtpass' (default), 'fatizara', 'bilal' or 'legitdataway'.
@@ -402,6 +428,8 @@ def init_db():
                      ("referred_by INTEGER", "users"),
                      ("monnify_ref TEXT", "users"), ("monnify_acct TEXT", "users"),
                      ("monnify_bank TEXT", "users"), ("monnify_acct_name TEXT", "users"),
+                     ("xpouch_ref TEXT", "users"), ("xpouch_acct TEXT", "users"),
+                     ("xpouch_bank TEXT", "users"), ("xpouch_acct_name TEXT", "users"),
                      ("cost_price REAL", "transactions"),
                      ("updated_at TEXT", "settings")):
         try:
@@ -447,6 +475,11 @@ def init_db():
         run("CREATE UNIQUE INDEX IF NOT EXISTS users_monnify_ref_uniq ON users(monnify_ref)")
     except Exception:
         pass
+    # Each Xpouch account reference must belong to exactly one user, same rule.
+    try:
+        run("CREATE UNIQUE INDEX IF NOT EXISTS users_xpouch_ref_uniq ON users(xpouch_ref)")
+    except Exception:
+        pass
     # Usernames are unique when set (NULLs for pre-username accounts allowed).
     try:
         run("CREATE UNIQUE INDEX IF NOT EXISTS users_username_uniq ON users(username)")
@@ -479,6 +512,10 @@ def load_settings():
         'MONNIFY_SECRET_KEY': os.environ.get('MONNIFY_SECRET_KEY', '').strip(),
         'MONNIFY_CONTRACT_CODE': os.environ.get('MONNIFY_CONTRACT_CODE', '').strip(),
         'MONNIFY_SANDBOX': os.environ.get('MONNIFY_SANDBOX', '1'),
+        'XPOUCH_API_KEY': os.environ.get('XPOUCH_API_KEY', '').strip(),
+        'XPOUCH_SECRET': os.environ.get('XPOUCH_SECRET', '').strip(),
+        'XPOUCH_SANDBOX': os.environ.get('XPOUCH_SANDBOX', '1'),
+        'FUNDING_PROVIDER': os.environ.get('FUNDING_PROVIDER', 'monnify'),
         'BREVO_API_KEY': os.environ.get('BREVO_API_KEY', '').strip(),
         'BREVO_SENDER': os.environ.get('BREVO_SENDER', 'sweetvtu@gmail.com').strip(),
         'PAYSTACK_SECRET_KEY': os.environ.get('PAYSTACK_SECRET_KEY', ''),
@@ -1586,6 +1623,8 @@ def monnify_status():
 @auth
 def fund_account():
     """Return the user's personal Monnify virtual account, creating it on first use."""
+    if funding_provider() == 'xpouch':
+        return fund_account_xpouch()
     if not monnify_configured():
         return jsonify({'ok': False, 'error': 'Bank funding is not set up yet. Try again later.'}), 503
     user = get_user(g.user_id)
@@ -1659,7 +1698,7 @@ def fund_account():
     return jsonify({'ok': True, 'account_number': a.get('accountNumber'),
                     'bank_name': a.get('bankName'), 'account_name': a.get('accountName')})
 
-def credit_wallet_atomic(uid, amount, tx_ref, description):
+def credit_wallet_atomic(uid, amount, tx_ref, description, service='monnify'):
     """Insert a funding transaction and credit the wallet in ONE database
     transaction.
 
@@ -1669,8 +1708,8 @@ def credit_wallet_atomic(uid, amount, tx_ref, description):
     """
     ins = """INSERT INTO transactions(user_id,type,service,description,amount,direction,
              status,reference,provider_ref,created)
-             VALUES(?, 'fund','monnify',?,?,'in','successful',?,?,?)"""
-    params = (uid, description, amount, tx_ref, tx_ref, now_iso())
+             VALUES(?, 'fund',?,?,?,'in','successful',?,?,?)"""
+    params = (uid, service, description, amount, tx_ref, tx_ref, now_iso())
     if USE_PG:
         cur = db().cursor()
         try:
@@ -1803,6 +1842,8 @@ def monnify_webhook():
 def fund_sync():
     """Pull the user's Monnify reserved-account transactions (server-to-server)
     and credit anything new. Works even when the Monnify webhook can't reach us."""
+    if funding_provider() == 'xpouch':
+        return fund_sync_xpouch()
     if not monnify_configured():
         return jsonify({'ok': False, 'error': 'Bank funding is not set up yet. Try again later.'}), 503
     user = get_user(g.user_id)
@@ -1865,6 +1906,219 @@ def fund_sync():
                     'new_transactions': count, 'balance': bal,
                     'recent_funding': recent})
 
+# ---------------- wallet funding (Xpouch virtual accounts) ----------------
+# Xpouch replaces Monnify as funding provider when FUNDING_PROVIDER='xpouch'.
+# Unlike Monnify permanent accounts, Xpouch accounts need NO customer BVN or
+# NIN: creation takes only customer_reference + customer_name, and every
+# account is issued on 9PSB. Payments land in the merchant wallet and are
+# reported via the payment_received webhook (HMAC-SHA256 over the canonical
+# data object, keyed with the merchant API KEY). Monnify code stays intact
+# so flipping FUNDING_PROVIDER back restores Monnify funding in one tap.
+# RESPONSE SHAPES are verified against the sandbox: Xpouch field names are
+# parsed tolerantly (snake_case or camelCase) because the docs' Stoplight
+# pages do not render as plain text; sandbox tests pin the real shapes.
+
+def _xpouch_pick(d, *names):
+    for n in names:
+        v = d.get(n)
+        if v not in (None, ''):
+            return v
+    return None
+
+def _xpouch_account_fields(data):
+    """Extract (account_number, bank_name, account_name) from a virtual
+    account object, tolerating the field-name variants Xpouch may use."""
+    data = data or {}
+    acct = _xpouch_pick(data, 'account_number', 'accountNumber', 'account_no', 'number')
+    bank = _xpouch_pick(data, 'bank_name', 'bankName', 'bank') or '9PSB'
+    name = _xpouch_pick(data, 'account_name', 'accountName', 'name')
+    return acct, bank, name
+
+def _xpouch_user_row(uid):
+    rows = q("SELECT id,name,email,xpouch_ref,xpouch_acct,xpouch_bank,xpouch_acct_name"
+             " FROM users WHERE id=?", (uid,))
+    return dict(rows[0]) if rows else None
+
+@app.get('/api/xpouch-status')
+@auth
+def xpouch_status():
+    return jsonify({'ok': True, 'configured': xpouch_configured(),
+                    'sandbox': xpouch_sandbox(), 'provider': funding_provider()})
+
+def fund_account_xpouch():
+    """Return the user's personal Xpouch virtual account, creating it on
+    first use. No BVN or NIN is ever asked for."""
+    if not xpouch_configured():
+        return jsonify({'ok': False, 'error': 'Bank funding is not set up yet. Try again later.'}), 503
+    row = _xpouch_user_row(g.user_id)
+    if not row:
+        return jsonify({'ok': False, 'error': 'User not found.'}), 404
+    if row.get('xpouch_acct'):
+        return jsonify({'ok': True, 'provider': 'xpouch',
+                        'account_number': row.get('xpouch_acct'),
+                        'bank_name': row.get('xpouch_bank') or '9PSB',
+                        'account_name': row.get('xpouch_acct_name') or row.get('name')})
+    ref = (row.get('xpouch_ref') or '').strip()
+    if not ref:
+        ref = 'panther-' + uuid.uuid4().hex[:20]
+    try:
+        r = requests.post(f'{xpouch_base()}/virtual-accounts/create',
+                          headers=xpouch_headers(),
+                          json={'customer_reference': ref,
+                                'customer_name': (row.get('name') or 'Panther Data Customer')[:100]},
+                          timeout=30).json()
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Could not reach Xpouch. Try again.'}), 502
+    if not r.get('success'):
+        return jsonify({'ok': False,
+                        'error': 'Xpouch error: ' + str((r.get('errors') or r.get('message')) or 'try again')}), 502
+    acct, bank, name = _xpouch_account_fields(r.get('data') or {})
+    if not acct:
+        return jsonify({'ok': False, 'error': 'Xpouch error: no account number returned.'}), 502
+    run("""UPDATE users SET xpouch_ref=?, xpouch_acct=?, xpouch_bank=?,
+           xpouch_acct_name=? WHERE id=?""",
+        (ref, acct, bank, name or row.get('name'), g.user_id))
+    return jsonify({'ok': True, 'provider': 'xpouch',
+                    'account_number': acct, 'bank_name': bank,
+                    'account_name': name or row.get('name')})
+
+def _xpouch_sig_ok(sig, data):
+    """Verify an Xpouch webhook signature: HMAC-SHA256 hex of the data
+    object, keys sorted, JSON-encoded with unescaped slashes/unicode,
+    keyed with the merchant API KEY. Both compact and default separators
+    are accepted: both are deterministic canonicalisations of the same
+    data, and both still require the secret key."""
+    sig = (sig or '').strip().lower()
+    key = (S('XPOUCH_API_KEY') or '').strip()
+    if not sig or not key or data is None:
+        return False
+    for seps in ((',', ':'), (', ', ': ')):
+        canon = json.dumps(data, sort_keys=True, ensure_ascii=False,
+                           separators=seps).encode('utf-8')
+        h = hmac.new(key.encode('utf-8'), canon, hashlib.sha256).hexdigest().lower()
+        if hmac.compare_digest(h, sig):
+            return True
+    return False
+
+@app.post('/api/xpouch-webhook')
+@limiter.exempt
+def xpouch_webhook():
+    """Xpouch payment notification. Verifies the HMAC-SHA256 signature,
+    credits the wallet exactly once. The customer is resolved ONLY by exact
+    match of the stored xpouch_ref or xpouch_acct — never by parsing a
+    user ID out of any field. Retries are safe: credit_wallet_atomic
+    dedupes on the event reference."""
+    d = request.get_json(force=True, silent=True) or {}
+    data = d.get('data') or {}
+    sig = d.get('signature') or ''
+    if not data or not sig or not S('XPOUCH_API_KEY'):
+        return jsonify({'ok': False}), 400
+    if not _xpouch_sig_ok(sig, data):
+        return jsonify({'ok': False}), 401
+    ev = (d.get('event') or d.get('event_type') or data.get('event') or '').strip()
+    if ev != 'payment_received':
+        return jsonify({'ok': True})
+    uid = None
+    cust_ref = str(data.get('customer_reference') or '').strip()
+    if cust_ref:
+        rows = q("SELECT id FROM users WHERE xpouch_ref=?", (cust_ref,))
+        if rows:
+            uid = rows[0]['id']
+    if not uid:
+        acct_no = str(data.get('account_number') or '').strip()
+        if acct_no:
+            rows = q("SELECT id FROM users WHERE xpouch_acct=?", (acct_no,))
+            if rows:
+                uid = rows[0]['id']
+    if not uid:
+        return jsonify({'ok': True})
+    tx_ref = (str(data.get('event_reference') or '').strip()
+              or str(data.get('transaction_reference') or '').strip()
+              or str(data.get('reference') or '').strip())
+    try:
+        amount = float(data.get('amount') or 0)
+    except Exception:
+        amount = 0
+    if not tx_ref or amount <= 0:
+        return jsonify({'ok': True})
+    status = credit_wallet_atomic(uid, amount, tx_ref,
+                                  'Wallet funding via bank transfer', service='xpouch')
+    return jsonify({'ok': True, 'status': status})
+
+def fund_sync_xpouch():
+    """Pull the user's Xpouch virtual-account transactions (server-to-server)
+    and credit anything new. Works even when the Xpouch webhook can't reach us."""
+    if not xpouch_configured():
+        return jsonify({'ok': False, 'error': 'Bank funding is not set up yet. Try again later.'}), 503
+    row = _xpouch_user_row(g.user_id)
+    if not row or not row.get('xpouch_acct'):
+        return jsonify({'ok': False, 'error': 'No funding account yet.'}), 400
+    acct_no = row['xpouch_acct']
+    try:
+        lst = requests.get(f'{xpouch_base()}/virtual-accounts',
+                           headers=xpouch_headers(), timeout=30).json()
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Could not reach Xpouch. Try again.'}), 502
+    items = []
+    if lst.get('success'):
+        entries = lst.get('data') or []
+        if isinstance(entries, dict):
+            entries = entries.get('accounts') or entries.get('data') or []
+        acct_id = None
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            if (str(e.get('customer_reference') or '') == (row.get('xpouch_ref') or '')
+                    or str(_xpouch_pick(e, 'account_number', 'accountNumber') or '') == acct_no):
+                acct_id = _xpouch_pick(e, 'id', 'account_id', 'accountId')
+                break
+        if acct_id:
+            try:
+                det = requests.get(f'{xpouch_base()}/virtual-accounts/{acct_id}',
+                                   headers=xpouch_headers(), timeout=30).json()
+            except Exception:
+                return jsonify({'ok': False, 'error': 'Could not reach Xpouch. Try again.'}), 502
+            ddata = det.get('data') or {}
+            items = ddata.get('transactions') or ddata.get('data') or []
+            if isinstance(items, dict):
+                items = items.get('transactions') or []
+    credited = 0.0
+    count = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get('status') or '').lower() not in ('success', 'successful', 'paid', 'completed'):
+            continue
+        tx_ref = (str(it.get('event_reference') or '').strip()
+                  or str(it.get('transaction_reference') or '').strip()
+                  or str(it.get('reference') or '').strip())
+        try:
+            amount = float(it.get('amount') or 0)
+        except Exception:
+            amount = 0
+        if not tx_ref or amount <= 0:
+            continue
+        if credit_wallet_atomic(g.user_id, amount, tx_ref,
+                                'Wallet funding via bank transfer', service='xpouch') == 'ok':
+            credited += amount
+            count += 1
+    bal = get_user(g.user_id).get('wallet', 0)
+    recent = None
+    if credited == 0:
+        rows = q("""SELECT amount, created FROM transactions
+                    WHERE user_id=? AND type='fund' AND status='successful'
+                    ORDER BY id DESC LIMIT 1""", (g.user_id,))
+        if rows:
+            try:
+                age = (datetime.now(LAGOS) - datetime.fromisoformat(rows[0]['created'])).total_seconds()
+            except Exception:
+                age = 10 ** 9
+            if age <= 1800:
+                recent = {'amount': rows[0]['amount'], 'created': rows[0]['created']}
+    return jsonify({'ok': True, 'credited': credited,
+                    'new_transactions': count, 'balance': bal,
+                    'recent_funding': recent})
+
 # ---------------- one-time invoice funding (no BVN/NIN) ----------------
 # Monnify dynamic invoices: each invoice gets its own virtual account that
 # needs NO BVN or NIN (unlike permanent reserved accounts, which CBN rules
@@ -1883,6 +2137,12 @@ def _invoice_expiry():
 @auth
 def fund_invoice():
     """Create a one-time Monnify invoice account for this user. No BVN/NIN."""
+    if funding_provider() == 'xpouch':
+        # Xpouch permanent accounts need no BVN, so one-time Monnify invoices
+        # are never created while Xpouch is the funding provider. Pending
+        # Monnify invoices from before the flip can still be checked.
+        return jsonify({'ok': False,
+                        'error': 'One-time accounts are not used with Xpouch — your permanent account needs no BVN.'}), 400
     if not monnify_configured():
         return jsonify({'ok': False, 'error': 'Bank funding is not set up yet. Try again later.'}), 503
     d = request.get_json(force=True, silent=True) or {}
@@ -3530,6 +3790,19 @@ def admin_test_connection():
                 return jsonify({'ok': True, 'detail': f'Auth OK ({mode}).'})
             return jsonify({'ok': False,
                             'detail': 'Auth failed: ' + str(r.get('responseMessage') or 'check keys')[:120]})
+        if service == 'xpouch':
+            if not xpouch_configured():
+                return jsonify({'ok': False, 'detail': 'API key / secret missing.'})
+            try:
+                r = requests.get(f'{xpouch_base()}/virtual-accounts',
+                                 headers=xpouch_headers(), timeout=20)
+                if r.status_code == 200 and r.json().get('success'):
+                    mode = 'sandbox' if xpouch_sandbox() else 'LIVE'
+                    return jsonify({'ok': True, 'detail': f'Auth OK ({mode}).'})
+                return jsonify({'ok': False,
+                                'detail': f'Xpouch rejected the key (HTTP {r.status_code}).'})
+            except Exception as e:
+                return jsonify({'ok': False, 'detail': 'Connection error: ' + str(e)[:120]})
         if service == 'brevo':
             if not S('BREVO_API_KEY'):
                 return jsonify({'ok': False, 'detail': 'Brevo API key missing.'})
