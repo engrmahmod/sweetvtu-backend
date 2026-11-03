@@ -2661,6 +2661,37 @@ def bilal_balance():
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 502
 
+@app.get('/api/admin/provider-balance')
+@admin_session_auth
+def provider_balance():
+    """Wallet balance of the ACTIVE buying provider (Bilal, LegitDataWay
+    or Fatizara). Staff may call it, like bilal-balance — unlike
+    test-connection, which is main-admin-only and would log staff out."""
+    prov = provider()
+    try:
+        if prov == 'bilal':
+            if not bilal_configured():
+                return jsonify({'ok': False, 'error': 'Bilal username / password missing.'}), 502
+            _, auth_resp = bilal_token()
+        elif prov == 'legitdataway':
+            if not legitdataway_configured():
+                return jsonify({'ok': False, 'error': 'LegitDataWay username / password missing.'}), 502
+            _, auth_resp = legitdataway_token()
+        elif prov == 'fatizara':
+            if not fatizara_configured():
+                return jsonify({'ok': False, 'error': 'Fatizara username / password missing.'}), 502
+            _, auth_resp = fatizara_token()
+        else:
+            return jsonify({'ok': False, 'error': 'No wallet balance for provider ' + prov + '.'}), 502
+        bal = auth_resp.get('balance')
+        try: bal = float(str(bal).replace(',', ''))
+        except (TypeError, ValueError): bal = None
+        if bal is None:
+            return jsonify({'ok': False, 'error': 'Could not read balance.'}), 502
+        return jsonify({'ok': True, 'balance': bal, 'provider': prov})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': 'Connection error: ' + str(e)[:120]}), 502
+
 @app.get('/api/admin/bilal-plans')
 @admin_session_auth
 def bilal_plans_admin():
