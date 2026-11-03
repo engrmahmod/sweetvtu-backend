@@ -3045,33 +3045,43 @@ def legitdataway_seed_data():
     """Seed discos + plans from the docs/dashboard tables captured 2026-11-03.
     Data sell = cost + ₦50 (Mahmod's rule); cable sell = cost (at cost).
     Vitel data plans are NOT seeded: LegitDataWay docs give them no network id.
-    Safe to re-run: updates cost/name, never overwrites an admin-set sell price."""
-    n_discos = 0
-    for disco_key, lw_id, label in LEGITDATAWAY_DISCO_SEED:
-        run("""INSERT INTO legitdataway_discos(disco_key,legitdataway_id,label,updated)
-               VALUES(?,?,?,?)
-               ON CONFLICT(disco_key) DO UPDATE SET legitdataway_id=excluded.legitdataway_id,
-               label=excluded.label, updated=excluded.updated""",
-            (disco_key, str(lw_id), label, now_iso()))
-        n_discos += 1
-    n_plans = 0
-    for plan_id, net, name, cost, sell in LW_DATA_SEED:
-        run("""INSERT INTO legitdataway_plans(plan_id,service,network,name,cost,sell,updated)
-               VALUES(?,?,?,?,?,?,?)
-               ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
-               network=excluded.network, name=excluded.name, cost=excluded.cost,
-               updated=excluded.updated""",
-            (plan_id, 'data', net, name, cost, sell, now_iso()))
-        n_plans += 1
-    for plan_id, net, name, cost, sell in LW_CABLE_SEED:
-        run("""INSERT INTO legitdataway_plans(plan_id,service,network,name,cost,sell,updated)
-               VALUES(?,?,?,?,?,?,?)
-               ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
-               network=excluded.network, name=excluded.name, cost=excluded.cost,
-               updated=excluded.updated""",
-            (plan_id, 'cable', net, name, cost, sell, now_iso()))
-        n_plans += 1
-    return n_plans, n_discos
+    Safe to re-run: updates cost/name, never overwrites an admin-set sell price.
+    Single transaction: the old per-row commits took 224 round trips and could
+    outrun gunicorn's 30s worker timeout (admin tap showed 'Failed to fetch')."""
+    ph = '%s' if USE_PG else '?'
+    con = db()
+    cur = con.cursor()
+    try:
+        cur.executemany(
+            "INSERT INTO legitdataway_discos(disco_key,legitdataway_id,label,updated)"
+            f" VALUES({ph},{ph},{ph},{ph})"
+            " ON CONFLICT(disco_key) DO UPDATE SET legitdataway_id=excluded.legitdataway_id,"
+            " label=excluded.label, updated=excluded.updated",
+            [(k, str(i), label, now_iso()) for k, i, label in LEGITDATAWAY_DISCO_SEED])
+        rows = ([(pid, 'data', net, name, cost, sell, now_iso())
+                 for pid, net, name, cost, sell in LW_DATA_SEED]
+                + [(pid, 'cable', net, name, cost, sell, now_iso())
+                   for pid, net, name, cost, sell in LW_CABLE_SEED])
+        cur.executemany(
+            "INSERT INTO legitdataway_plans(plan_id,service,network,name,cost,sell,updated)"
+            f" VALUES({ph},{ph},{ph},{ph},{ph},{ph},{ph})"
+            " ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,"
+            " network=excluded.network, name=excluded.name, cost=excluded.cost,"
+            " updated=excluded.updated",
+            rows)
+        con.commit()
+        return len(rows), len(LEGITDATAWAY_DISCO_SEED)
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
 
 @app.post('/api/admin/legitdataway-seed-plans')
 @admin_session_auth
