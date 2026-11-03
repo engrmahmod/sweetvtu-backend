@@ -1982,23 +1982,75 @@ def fund_account_xpouch():
                     'account_number': acct, 'bank_name': bank,
                     'account_name': name or row.get('name')})
 
+def _xpouch_canon_variants(data):
+    """All deterministic canonical writings of an Xpouch data object that
+    a sender could plausibly sign. Xpouch's docs say 'keys sorted,
+    JSON-encoded with unescaped slashes/unicode' but do NOT say whether
+    sorting is recursive: the live payload's nested payer object arrives
+    in insertion order (account_number, account_name, bank_name — NOT
+    alphabetical), so a signer that sorts only the top level writes a
+    different string than a fully recursive sort. The dashboard's Test
+    Signature tool also shows a flat 8-field sample. Accepting several
+    variants does NOT weaken the check: every variant still requires the
+    exact merchant API key and the exact data — a forger knowing none of
+    them can satisfy no variant."""
+    variants = []
+    for seps in ((',', ':'), (', ', ': ')):
+        # Fully recursive sort (original implementation).
+        variants.append(json.dumps(data, sort_keys=True, ensure_ascii=False,
+                                   separators=seps))
+        # Top level sorted only, nested objects in arrival order.
+        top_sorted = {k: data[k] for k in sorted(data.keys())}
+        variants.append(json.dumps(top_sorted, ensure_ascii=False,
+                                   separators=seps))
+        # Arrival order entirely.
+        variants.append(json.dumps(data, ensure_ascii=False, separators=seps))
+    payer = data.get('payer') or {}
+    flat = {
+        'account_number': data.get('account_number'),
+        'amount': data.get('amount'),
+        'currency': data.get('currency'),
+        'customer_reference': data.get('customer_reference'),
+        'payer_account_name': payer.get('account_name') or payer.get('accountName'),
+        'payer_account_number': payer.get('account_number') or payer.get('accountNumber'),
+        'payer_bank_name': payer.get('bank_name') or payer.get('bankName'),
+        'transaction_reference': data.get('transaction_reference'),
+    }
+    flat = {k: v for k, v in flat.items() if v is not None}
+    for seps in ((',', ':'), (', ', ': ')):
+        variants.append(json.dumps(flat, sort_keys=True, ensure_ascii=False,
+                                   separators=seps))
+    return variants
+
 def _xpouch_sig_ok(sig, data):
     """Verify an Xpouch webhook signature: HMAC-SHA256 hex of the data
-    object, keys sorted, JSON-encoded with unescaped slashes/unicode,
-    keyed with the merchant API KEY. Both compact and default separators
-    are accepted: both are deterministic canonicalisations of the same
-    data, and both still require the secret key."""
+    object, keyed with the merchant API KEY. Several canonical writings
+    are accepted (see _xpouch_canon_variants) because the sender's exact
+    sorting depth is undocumented; all of them still require the key."""
     sig = (sig or '').strip().lower()
     key = (S('XPOUCH_API_KEY') or '').strip()
     if not sig or not key or data is None:
         return False
-    for seps in ((',', ':'), (', ', ': ')):
-        canon = json.dumps(data, sort_keys=True, ensure_ascii=False,
-                           separators=seps).encode('utf-8')
-        h = hmac.new(key.encode('utf-8'), canon, hashlib.sha256).hexdigest().lower()
+    for canon in _xpouch_canon_variants(data):
+        h = hmac.new(key.encode('utf-8'), canon.encode('utf-8'),
+                     hashlib.sha256).hexdigest().lower()
         if hmac.compare_digest(h, sig):
             return True
     return False
+
+def _xpouch_credit_amount(d):
+    """What actually lands in the merchant wallet. Xpouch deducts its 1%
+    fee before the wallet: a ₦100 transfer arrives as amount=100, fee=1,
+    settled_amount=99, net_amount=99. Crediting `amount` would over-credit
+    by the fee on every funding, so prefer net, then settled, then amount."""
+    for k in ('net_amount', 'settled_amount', 'amount'):
+        try:
+            v = float(d.get(k) or 0)
+        except Exception:
+            v = 0
+        if v > 0:
+            return v
+    return 0
 
 @app.post('/api/xpouch-webhook')
 @limiter.exempt
@@ -2035,10 +2087,7 @@ def xpouch_webhook():
     tx_ref = (str(data.get('event_reference') or '').strip()
               or str(data.get('transaction_reference') or '').strip()
               or str(data.get('reference') or '').strip())
-    try:
-        amount = float(data.get('amount') or 0)
-    except Exception:
-        amount = 0
+    amount = _xpouch_credit_amount(data)
     if not tx_ref or amount <= 0:
         return jsonify({'ok': True})
     status = credit_wallet_atomic(uid, amount, tx_ref,
@@ -2063,14 +2112,17 @@ def fund_sync_xpouch():
     if lst.get('success'):
         entries = lst.get('data') or []
         if isinstance(entries, dict):
-            entries = entries.get('accounts') or entries.get('data') or []
+            entries = (entries.get('accounts') or entries.get('data')
+                       or entries.get('virtual_accounts')
+                       or entries.get('items') or entries.get('results') or [])
         acct_id = None
         for e in entries:
             if not isinstance(e, dict):
                 continue
-            if (str(e.get('customer_reference') or '') == (row.get('xpouch_ref') or '')
+            if (str(e.get('customer_reference') or e.get('customerReference') or '') == (row.get('xpouch_ref') or '')
                     or str(_xpouch_pick(e, 'account_number', 'accountNumber') or '') == acct_no):
-                acct_id = _xpouch_pick(e, 'id', 'account_id', 'accountId')
+                acct_id = _xpouch_pick(e, 'id', 'account_id', 'accountId',
+                                       'uuid', 'reference', 'virtual_account_id')
                 break
         if acct_id:
             try:
@@ -2078,24 +2130,27 @@ def fund_sync_xpouch():
                                    headers=xpouch_headers(), timeout=30).json()
             except Exception:
                 return jsonify({'ok': False, 'error': 'Could not reach Xpouch. Try again.'}), 502
-            ddata = det.get('data') or {}
-            items = ddata.get('transactions') or ddata.get('data') or []
-            if isinstance(items, dict):
-                items = items.get('transactions') or []
+            ddata = det.get('data') if isinstance(det, dict) else None
+            if isinstance(ddata, dict):
+                items = (ddata.get('transactions') or ddata.get('items')
+                         or ddata.get('history') or ddata.get('data') or [])
+                if isinstance(items, dict):
+                    items = items.get('transactions') or []
+            elif isinstance(ddata, list):
+                items = ddata
+            elif isinstance(det, dict):
+                items = det.get('transactions') or []
     credited = 0.0
     count = 0
     for it in items:
         if not isinstance(it, dict):
             continue
-        if str(it.get('status') or '').lower() not in ('success', 'successful', 'paid', 'completed'):
+        if str(it.get('status') or '').lower() not in ('success', 'successful', 'paid', 'completed', 'complete'):
             continue
         tx_ref = (str(it.get('event_reference') or '').strip()
                   or str(it.get('transaction_reference') or '').strip()
                   or str(it.get('reference') or '').strip())
-        try:
-            amount = float(it.get('amount') or 0)
-        except Exception:
-            amount = 0
+        amount = _xpouch_credit_amount(it)
         if not tx_ref or amount <= 0:
             continue
         if credit_wallet_atomic(g.user_id, amount, tx_ref,
