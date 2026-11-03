@@ -323,6 +323,10 @@ def init_db():
              wallet REAL DEFAULT 0, created TEXT)""",
         """CREATE TABLE IF NOT EXISTS tokens(
              token TEXT PRIMARY KEY, user_id INTEGER, created TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS referral_rewards(
+             id {auto}, referrer_id INTEGER, milestone INTEGER,
+             amount REAL, created TEXT,
+             UNIQUE(referrer_id, milestone))""",
         f"""CREATE TABLE IF NOT EXISTS email_codes(
              id {auto}, user_id INTEGER,
              code_hash TEXT, purpose TEXT, expires_at TEXT, created TEXT)""",
@@ -395,6 +399,7 @@ def init_db():
     for col, tbl in (("email_verified INTEGER DEFAULT 0", "users"),
                      ("tx_pin_hash TEXT", "users"),
                      ("username TEXT", "users"),
+                     ("referred_by INTEGER", "users"),
                      ("monnify_ref TEXT", "users"), ("monnify_acct TEXT", "users"),
                      ("monnify_bank TEXT", "users"), ("monnify_acct_name TEXT", "users"),
                      ("cost_price REAL", "transactions"),
@@ -418,6 +423,20 @@ def init_db():
             COST_COL_READY = 'cost_price' in cols
     except Exception:
         COST_COL_READY = False
+    # Referrals: same pattern — the referred_by column gates referral
+    # counting and rewards, so a worker where the ALTER has not landed
+    # simply does not attach referrals yet, instead of failing signups.
+    global REF_COL_READY
+    try:
+        if USE_PG:
+            rows = q("SELECT column_name FROM information_schema.columns "
+                     "WHERE table_name='users' AND column_name='referred_by'")
+            REF_COL_READY = len(rows) > 0
+        else:
+            cols = [r['name'] for r in q("PRAGMA table_info(users)")]
+            REF_COL_READY = 'referred_by' in cols
+    except Exception:
+        REF_COL_READY = False
     # New security columns are migrated separately (non-blocking) so a
     # locked ALTER can never hang the deploy. See _try_security_migration().
     _try_security_migration()
@@ -1197,6 +1216,7 @@ def signup():
     name, phone, email, pw = (d.get('name') or '').strip(), (d.get('phone') or '').strip(), \
                              (d.get('email') or '').strip(), d.get('password') or ''
     username = (d.get('username') or '').strip()
+    ref_code = (d.get('ref') or '').strip()
     pin = str(d.get('pin') or '').strip()
     if len(name) < 3: return jsonify({'ok': False, 'error': 'Please enter your full name.'}), 400
     if not re.match(r'^[A-Za-z0-9_]{3,20}$', username):
@@ -1210,15 +1230,73 @@ def signup():
         return jsonify({'ok': False, 'error': 'This username is already taken.'}), 400
     if q("SELECT id FROM users WHERE phone=?", (phone,)):
         return jsonify({'ok': False, 'error': 'This number is already registered. Sign in instead.'}), 400
-    run("""INSERT INTO users(name,username,phone,email,pass_hash,tx_pin_hash,email_verified,wallet,created)
-           VALUES(?,?,?,?,?,?,0,0,?)""",
-        (name, username, phone, email, generate_password_hash(pw), generate_password_hash(pin), now_iso()))
+    # Referral: the code is the referrer's username. Invalid codes and
+    # self-referrals are ignored — signup never fails over a referral.
+    referrer_id = None
+    if REF_COL_READY and ref_code and ref_code.lower() != username.lower():
+        rr = q("SELECT id FROM users WHERE LOWER(username)=LOWER(?)", (ref_code,))
+        referrer_id = rr[0]['id'] if rr else None
+    if REF_COL_READY:
+        run("""INSERT INTO users(name,username,phone,email,pass_hash,tx_pin_hash,email_verified,wallet,created,referred_by)
+               VALUES(?,?,?,?,?,?,0,0,?,?)""",
+            (name, username, phone, email, generate_password_hash(pw), generate_password_hash(pin), now_iso(), referrer_id))
+    else:
+        run("""INSERT INTO users(name,username,phone,email,pass_hash,tx_pin_hash,email_verified,wallet,created)
+               VALUES(?,?,?,?,?,?,0,0,?)""",
+            (name, username, phone, email, generate_password_hash(pw), generate_password_hash(pin), now_iso()))
     uid = q("SELECT id FROM users WHERE phone=?", (phone,))[0]['id']
     user = get_user(uid)
     email_sent = send_verify_code(user)
     # no token yet — account opens only after the email code is verified
     return jsonify({'ok': True, 'verify_required': True, 'user_id': uid,
                     'email': email, 'email_sent': email_sent})
+
+def credit_referral_milestones(referrer_id):
+    """Credit ₦500 per 5 verified referrals. Idempotent: one reward row
+    per (referrer, milestone), so a recount or retry never double-pays.
+    Counts only verified referrals, so a signup counts once its email
+    code is confirmed — no money needs to move from the referred person."""
+    if not referrer_id or not REF_COL_READY:
+        return
+    try:
+        rows = q("SELECT COUNT(*) AS n FROM users WHERE referred_by=? AND email_verified=1", (referrer_id,))
+        count = (rows[0]['n'] if rows else 0) or 0
+        for m in range(5, count + 1, 5):
+            if q("SELECT id FROM referral_rewards WHERE referrer_id=? AND milestone=?", (referrer_id, m)):
+                continue
+            ref = 'REF-' + uuid.uuid4().hex[:12]
+            run("UPDATE users SET wallet=wallet+500 WHERE id=?", (referrer_id,))
+            run("""INSERT INTO transactions(user_id,type,service,description,amount,direction,status,reference,created)
+                   VALUES(?, 'referral', 'referral', ?, 500, 'in', 'successful', ?, ?)""",
+                (referrer_id, 'Referral reward — %d referrals' % m, ref, now_iso()))
+            try:
+                run("INSERT INTO referral_rewards(referrer_id,milestone,amount,created) VALUES(?,?,500,?)",
+                    (referrer_id, m, now_iso()))
+            except Exception:
+                # Lost a race for this milestone: undo the credit so it
+                # stays exactly one ₦500 per milestone.
+                run("UPDATE users SET wallet=wallet-500 WHERE id=?", (referrer_id,))
+                run("DELETE FROM transactions WHERE reference=?", (ref,))
+    except Exception:
+        pass
+
+@app.get('/api/referral')
+@auth
+def referral_status():
+    me = get_user(g.user_id)
+    if not me:
+        return jsonify({'ok': False, 'error': 'Account not found.'}), 404
+    count = 0
+    if REF_COL_READY:
+        rows = q("SELECT COUNT(*) AS n FROM users WHERE referred_by=? AND email_verified=1", (g.user_id,))
+        count = (rows[0]['n'] if rows else 0) or 0
+    try:
+        rewards = q("SELECT milestone, amount, created FROM referral_rewards WHERE referrer_id=? ORDER BY milestone", (g.user_id,))
+    except Exception:
+        rewards = []
+    nxt = ((count // 5) + 1) * 5
+    return jsonify({'ok': True, 'code': me.get('username') or '', 'count': count,
+                    'next_milestone': nxt, 'to_go': nxt - count, 'rewards': rewards})
 
 @app.post('/api/verify-email')
 @limiter.limit('10 per minute')
@@ -1240,6 +1318,13 @@ def verify_email():
     if rows[0]['expires_at'] < now_iso():
         return jsonify({'ok': False, 'error': 'Code expired. Tap resend for a new one.'}), 400
     run("UPDATE users SET email_verified=1 WHERE id=?", (uid,))
+    try:
+        if REF_COL_READY:
+            rr = q("SELECT referred_by FROM users WHERE id=?", (uid,))
+            if rr and rr[0].get('referred_by'):
+                credit_referral_milestones(rr[0]['referred_by'])
+    except Exception:
+        pass
     run("DELETE FROM email_codes WHERE user_id=? AND purpose='verify'", (uid,))
     tok = new_session_token(uid)
     return jsonify({'ok': True, 'token': tok, 'user': get_user(uid)})
