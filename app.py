@@ -1225,7 +1225,13 @@ def debit_and_buy_legitdataway(user_id, amount, desc, tx_type, service, endpoint
                'Purchase is processing at LegitDataWay. It stays pending until confirmed — check back shortly.')
         return False, {'pending': True, 'reference': ref, 'error': msg}
     ok = status in ('success', 'successful')
-    err_text = resp.get('message') or resp.get('error') or 'Purchase failed.'
+    # Never show the provider's raw message to the customer: LegitDataWay's
+    # failure text describes the merchant-side refund (its discounted charge
+    # back to Panther's provider wallet), which reads to the customer as if
+    # they were short-refunded. The customer always gets the FULL amount back
+    # (see _settle_wallet), so say exactly that. The provider's raw message
+    # is still stored in the transaction meta for the admin.
+    err_text = f'Purchase failed. ₦{amount:,} has been refunded to your wallet.'
     ok, info = _settle_wallet(user_id, ref, amount, ok, provider_ref, token, resp, err_text)
     if ok and tx_type == 'power':
         # Electricity bills deduct amount + charges from the provider wallet
