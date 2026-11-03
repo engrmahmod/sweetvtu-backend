@@ -232,6 +232,9 @@ def run(sql, params=()):
 # Render deploys time out). NEW_COLS_READY gates the new session/PIN logic;
 # a background thread retries until the columns exist.
 NEW_COLS_READY = False
+# COST_COL_READY gates profit tracking: True once the transactions table
+# has a cost_price column, so buys keep working on any worker where the
+# ALTER has not landed yet (cost is then simply not recorded).
 _SECURITY_COLS = (
     ("expires_at TEXT", "tokens"),
     ("last_seen TEXT", "tokens"),
@@ -322,7 +325,7 @@ def init_db():
              id {auto}, user_id INTEGER, type TEXT,
              service TEXT, description TEXT, amount REAL, direction TEXT,
              status TEXT DEFAULT 'successful', reference TEXT UNIQUE,
-             provider_ref TEXT, meta TEXT, created TEXT)""",
+             provider_ref TEXT, meta TEXT, created TEXT, cost_price REAL)""",
         """CREATE TABLE IF NOT EXISTS plan_prices(
              variation_code TEXT PRIMARY KEY, sell_price REAL, cost_price REAL,
              label TEXT, updated TEXT)""",
@@ -384,11 +387,27 @@ def init_db():
                      ("username TEXT", "users"),
                      ("monnify_ref TEXT", "users"), ("monnify_acct TEXT", "users"),
                      ("monnify_bank TEXT", "users"), ("monnify_acct_name TEXT", "users"),
+                     ("cost_price REAL", "transactions"),
                      ("updated_at TEXT", "settings")):
         try:
             run(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except Exception:
             pass
+    # Profit tracking: verify the cost_price column actually exists so the
+    # buy paths know whether they can record the provider cost. A worker
+    # where the ALTER did not land keeps selling normally, just without
+    # cost recording, and the next deploy retries the migration.
+    global COST_COL_READY
+    try:
+        if USE_PG:
+            rows = q("SELECT column_name FROM information_schema.columns "
+                     "WHERE table_name='transactions' AND column_name='cost_price'")
+            COST_COL_READY = len(rows) > 0
+        else:
+            cols = [r['name'] for r in q("PRAGMA table_info(transactions)")]
+            COST_COL_READY = 'cost_price' in cols
+    except Exception:
+        COST_COL_READY = False
     # New security columns are migrated separately (non-blocking) so a
     # locked ALTER can never hang the deploy. See _try_security_migration().
     _try_security_migration()
@@ -885,10 +904,14 @@ def sell_price(variation_code, cost):
     margin = float((q("SELECT v FROM settings WHERE k='margin'") or [{'v': '0'}])[0]['v'])
     return round(float(cost) * (1 + margin / 100), 2)
 
-def _debit_wallet(user_id, amount, desc, tx_type, service):
+def _debit_wallet(user_id, amount, desc, tx_type, service, cost_price=None):
     """Insert a pending 'out' transaction and debit the wallet atomically.
     Returns (ref, None) on success, (None, error_info) on insufficient funds.
-    Shared by the VTpass and Fatizara buy paths so both refund identically."""
+    Shared by the VTpass and Fatizara buy paths so both refund identically.
+    cost_price is the provider cost known at buy time (data/cable plan
+    cost); airtime/power pass None so the admin never treats a guess as
+    an exact cost. When the column is missing, the cost is skipped and
+    the buy still succeeds exactly as before."""
     ref = 'SV' + secrets.token_hex(5).upper()
     con = db()
     try:
@@ -906,15 +929,25 @@ def _debit_wallet(user_id, amount, desc, tx_type, service):
         ts = now_iso()
         if USE_PG:
             cur = con.cursor()
-            cur.execute("""INSERT INTO transactions(user_id,type,service,description,amount,direction,
-                         status,reference,created) VALUES(%s,%s,%s,%s,%s,'out','pending',%s,%s)""",
-                        (user_id, tx_type, service, desc, amount, ref, ts))
+            if COST_COL_READY and cost_price is not None:
+                cur.execute("""INSERT INTO transactions(user_id,type,service,description,amount,direction,
+                             status,reference,created,cost_price) VALUES(%s,%s,%s,%s,%s,'out','pending',%s,%s,%s)""",
+                            (user_id, tx_type, service, desc, amount, ref, ts, float(cost_price)))
+            else:
+                cur.execute("""INSERT INTO transactions(user_id,type,service,description,amount,direction,
+                             status,reference,created) VALUES(%s,%s,%s,%s,%s,'out','pending',%s,%s)""",
+                            (user_id, tx_type, service, desc, amount, ref, ts))
             cur.execute("UPDATE users SET wallet=wallet-%s WHERE id=%s", (amount, user_id))
             con.commit(); cur.close()
         else:
-            con.execute("""INSERT INTO transactions(user_id,type,service,description,amount,direction,
-                         status,reference,created) VALUES(?,?,?,?,?,'out','pending',?,?)""",
-                        (user_id, tx_type, service, desc, amount, ref, ts))
+            if COST_COL_READY and cost_price is not None:
+                con.execute("""INSERT INTO transactions(user_id,type,service,description,amount,direction,
+                             status,reference,created,cost_price) VALUES(?,?,?,?,?,'out','pending',?,?,?)""",
+                            (user_id, tx_type, service, desc, amount, ref, ts, float(cost_price)))
+            else:
+                con.execute("""INSERT INTO transactions(user_id,type,service,description,amount,direction,
+                             status,reference,created) VALUES(?,?,?,?,?,'out','pending',?,?)""",
+                            (user_id, tx_type, service, desc, amount, ref, ts))
             con.execute("UPDATE users SET wallet=wallet-? WHERE id=?", (amount, user_id))
             con.commit()
     finally:
@@ -946,9 +979,9 @@ def _settle_wallet(user_id, ref, amount, ok, provider_ref, token, raw, err_text)
         if not USE_PG: con.close()
     return False, {'error': str(err_text)[:300], 'reference': ref}
 
-def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload):
+def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload, cost_price=None):
     """Debit wallet, call VTpass, refund on failure. Returns (ok, info)."""
-    ref, err = _debit_wallet(user_id, amount, desc, tx_type, service)
+    ref, err = _debit_wallet(user_id, amount, desc, tx_type, service, cost_price)
     if err:
         return False, err
     vt_payload = dict(vt_payload); vt_payload['request_id'] = request_id()
@@ -965,12 +998,12 @@ def debit_and_buy(user_id, amount, desc, tx_type, service, vt_payload):
     err_text = ((content.get('errors') or '') if isinstance(content, dict) else '') or resp.get('response_description') or 'Purchase failed.'
     return _settle_wallet(user_id, ref, amount, ok, provider_ref, token, resp, err_text)
 
-def debit_and_buy_fatizara(user_id, amount, desc, tx_type, service, endpoint, fz_payload):
+def debit_and_buy_fatizara(user_id, amount, desc, tx_type, service, endpoint, fz_payload, cost_price=None):
     """Debit wallet, call Fatizara, refund on failure. Same guarantees as
     debit_and_buy: a lost/failed provider reply can never double-charge.
     Fatizara has no sandbox, so this path only runs once the provider switch
     is on AND the Fatizara wallet is funded — every call is live."""
-    ref, err = _debit_wallet(user_id, amount, desc, tx_type, service)
+    ref, err = _debit_wallet(user_id, amount, desc, tx_type, service, cost_price)
     if err:
         return False, err
     fz_payload = dict(fz_payload); fz_payload['request-id'] = request_id()
@@ -984,14 +1017,14 @@ def debit_and_buy_fatizara(user_id, amount, desc, tx_type, service, endpoint, fz
     err_text = resp.get('message') or resp.get('error') or 'Purchase failed.'
     return _settle_wallet(user_id, ref, amount, ok, provider_ref, token, resp, err_text)
 
-def debit_and_buy_bilal(user_id, amount, desc, tx_type, service, endpoint, bl_payload):
+def debit_and_buy_bilal(user_id, amount, desc, tx_type, service, endpoint, bl_payload, cost_price=None):
     """Debit wallet, call Bilal, refund on failure. Same guarantees as
     debit_and_buy_fatizara, with one Bilal-specific rule: a 'pending' status
     is neither success nor failure — the debit stays and the transaction
     stays pending (see bilal-requery / transaction-resolve), because Bilal
     may still deliver it. Refunding a pending buy could double-spend if
     Bilal later delivers."""
-    ref, err = _debit_wallet(user_id, amount, desc, tx_type, service)
+    ref, err = _debit_wallet(user_id, amount, desc, tx_type, service, cost_price)
     if err:
         return False, err
     rid = request_id()
@@ -1839,7 +1872,8 @@ def buy_data():
         ok, info = debit_and_buy_fatizara(
             g.user_id, price, f"{p['name']} → {phone}", 'data', net, '/data',
             {'network': FATIZARA_NETWORKS.get(net, 1), 'phone': phone,
-             'data_plan': int(code) if code.isdigit() else code, 'bypass': False})
+             'data_plan': int(code) if code.isdigit() else code, 'bypass': False},
+            cost_price=cost)
         return jsonify({'ok': ok, **info})
     if provider() == 'bilal':
         if not bilal_configured():
@@ -1854,7 +1888,8 @@ def buy_data():
         ok, info = debit_and_buy_bilal(
             g.user_id, price, f"{p['name']} → {phone}", 'data', net, '/data',
             {'network': BILAL_NETWORKS.get(net, 1), 'phone': bl_phone(phone),
-             'data_plan': int(code) if code.isdigit() else code, 'bypass': False})
+             'data_plan': int(code) if code.isdigit() else code, 'bypass': False},
+            cost_price=cost)
         return jsonify({'ok': ok, **info})
     svc = DATA_SVC.get(net, 'mtn-data')
     varis = {v.get('variation_code'): v for v in vt_variations(svc)}
@@ -1865,7 +1900,8 @@ def buy_data():
     price = sell_price(code, cost)
     ok, info = debit_and_buy(g.user_id, price, f"{v.get('name')} → {phone}", 'data', net,
                              {'serviceID': svc, 'billersCode': phone,
-                              'variation_code': code, 'amount': cost, 'phone': phone})
+                              'variation_code': code, 'amount': cost, 'phone': phone},
+                             cost_price=cost)
     return jsonify({'ok': ok, **info})
 
 @app.get('/api/cable/plans')
@@ -1996,7 +2032,8 @@ def buy_cable():
             g.user_id, price, f"{prov.upper()} {p['name']} → {billers}",
             'cable', prov, '/cable',
             {'cable': FATIZARA_CABLES.get(prov, 2), 'iuc': billers,
-             'cable_plan': int(raw_plan) if raw_plan.isdigit() else raw_plan, 'bypass': False})
+             'cable_plan': int(raw_plan) if raw_plan.isdigit() else raw_plan, 'bypass': False},
+            cost_price=cost)
         return jsonify({'ok': ok, **info})
     if provider() == 'bilal':
         if not bilal_configured():
@@ -2016,7 +2053,8 @@ def buy_cable():
             'cable', prov, '/cable',
             {'cable': BILAL_CABLES.get(prov, 2),
              'cable_plan': int(raw_plan) if raw_plan.isdigit() else raw_plan,
-             'iuc': billers, 'bypass': 0})
+             'iuc': billers, 'bypass': 0},
+            cost_price=cost)
         return jsonify({'ok': ok, **info})
     varis = {v.get('variation_code'): v for v in vt_variations(svc)}
     if code not in varis:
@@ -2027,7 +2065,8 @@ def buy_cable():
     ok, info = debit_and_buy(g.user_id, price, f"{prov.upper()} {v.get('name')} → {billers}",
                              'cable', prov,
                              {'serviceID': svc, 'billersCode': billers, 'variation_code': code,
-                              'amount': cost, 'phone': phone or billers})
+                              'amount': cost, 'phone': phone or billers},
+                             cost_price=cost)
     return jsonify({'ok': ok, **info})
 
 @app.get('/api/power/discos')
