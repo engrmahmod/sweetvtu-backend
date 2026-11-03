@@ -43,11 +43,13 @@ SETTINGS_META = {
     'VTPASS_PUBLIC_KEY':  dict(group='VTpass',   label='Public Key',   secret=True),
     'VTPASS_SECRET_KEY':  dict(group='VTpass',   label='Secret Key',   secret=True),
     'VTPASS_SANDBOX':     dict(group='VTpass',   label='Sandbox mode — 1 = test, 0 = LIVE', secret=False),
-    'PROVIDER':           dict(group='Provider', label='Active provider — vtpass, fatizara or bilal', secret=False),
+    'PROVIDER':           dict(group='Provider', label='Active provider — vtpass, fatizara, bilal or legitdataway', secret=False),
     'FATIZARA_USERNAME':  dict(group='Fatizara', label='Fatizara username', secret=False),
     'FATIZARA_PASSWORD':  dict(group='Fatizara', label='Fatizara password', secret=True),
     'BILAL_USERNAME':     dict(group='Bilal',    label='Bilal username', secret=False),
     'BILAL_PASSWORD':     dict(group='Bilal',    label='Bilal password', secret=True),
+    'LEGITDATAWAY_USERNAME': dict(group='LegitDataWay', label='LegitDataWay username', secret=True),
+    'LEGITDATAWAY_PASSWORD': dict(group='LegitDataWay', label='LegitDataWay password', secret=True),
     'MONNIFY_API_KEY':    dict(group='Monnify',  label='API Key',      secret=True),
     'MONNIFY_SECRET_KEY': dict(group='Monnify',  label='Secret Key',   secret=True),
     'MONNIFY_CONTRACT_CODE': dict(group='Monnify', label='Contract Code', secret=True),
@@ -76,16 +78,19 @@ def monnify_base():
     return 'https://sandbox.monnify.com' if monnify_sandbox() else 'https://api.monnify.com'
 
 def provider():
-    """Active vending provider: 'vtpass' (default), 'fatizara' or 'bilal'.
+    """Active vending provider: 'vtpass' (default), 'fatizara', 'bilal' or 'legitdataway'.
     VTpass stays the default until the chosen provider is proven with test buys."""
     p = (S('PROVIDER') or 'vtpass').strip().lower()
-    return p if p in ('vtpass', 'fatizara', 'bilal') else 'vtpass'
+    return p if p in ('vtpass', 'fatizara', 'bilal', 'legitdataway') else 'vtpass'
 
 def fatizara_configured():
     return bool(S('FATIZARA_USERNAME') and S('FATIZARA_PASSWORD'))
 
 def bilal_configured():
     return bool(S('BILAL_USERNAME') and S('BILAL_PASSWORD'))
+
+def legitdataway_configured():
+    return bool(S('LEGITDATAWAY_USERNAME') and S('LEGITDATAWAY_PASSWORD'))
 
 LAGOS = timezone(timedelta(hours=1))
 
@@ -339,6 +344,11 @@ def init_db():
              name TEXT, cost REAL, sell REAL, updated TEXT)""",
         """CREATE TABLE IF NOT EXISTS bilal_discos(
              disco_key TEXT PRIMARY KEY, bilal_id TEXT, label TEXT, updated TEXT)""",
+        """CREATE TABLE IF NOT EXISTS legitdataway_plans(
+             plan_id TEXT PRIMARY KEY, service TEXT, network TEXT,
+             name TEXT, cost REAL, sell REAL, updated TEXT)""",
+        """CREATE TABLE IF NOT EXISTS legitdataway_discos(
+             disco_key TEXT PRIMARY KEY, legitdataway_id TEXT, label TEXT, updated TEXT)""",
         """CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT, updated_at TEXT)""",
         f"""CREATE TABLE IF NOT EXISTS admin_logs(
              id {auto}, action TEXT, detail TEXT, created TEXT)""",
@@ -874,6 +884,69 @@ def bilal_get(path, params=None):
                      timeout=30)
     return _provider_json(r, 'Bilal')
 
+
+# ---------------- LegitDataWay ----------------
+# Docs: https://app.legitdataway.com/documentation/home (login-walled).
+# Same two-step token flow as Bilal: POST /api/user with HTTP Basic auth
+# (username:password) returns an AccessToken, then every vending call carries
+# 'Authorization: Token <AccessToken>'. The AccessToken never expires per docs.
+# Data/airtime/bill payloads mirror Bilal's; cable differs: LegitDataWay wants
+# cablename + cableplan + smart_card_number (Bilal wants cable + cable_plan + iuc).
+# Disco IDs match Bilal EXCEPT 9/10 are swapped: LegitDataWay 9=Yola, 10=Benin
+# (Bilal 9=Benin, 10=Yola) — do NOT copy Bilal's disco map.
+# Cable plan ids in our DB carry a 'c:' prefix (same collision guard as Bilal:
+# numeric data and cable ids overlap); the prefix is stripped before sending.
+# LegitDataWay publishes no cable slug list — whether /api/cable accepts the
+# numeric plan id or a slug is proven by a live test buy before the switch
+# flips (see switch notes). Final outcomes also arrive via webhook
+# (request-id keyed); there is no documented requery endpoint, so a lost
+# reply stays pending for the webhook or the admin transaction-resolve
+# endpoint — it is NEVER auto-refunded.
+LEGITDATAWAY_BASE = 'https://legitdataway.com'
+LEGITDATAWAY_NETWORKS = {'mtn': 1, 'airtel': 2, 'glo': 3, 'etisalat': 4}
+LEGITDATAWAY_CABLES = {'gotv': 1, 'dstv': 2, 'startimes': 3}
+LEGITDATAWAY_DISCO_IDS = {'ikeja-electric': 1, 'eko-electric': 2, 'kano-electric': 3,
+                          'portharcourt-electric': 4, 'jos-electric': 5, 'ibadan-electric': 6,
+                          'kaduna-electric': 7, 'abuja-electric': 8, 'yola-electric': 9,
+                          'benin-electric': 10}
+
+def legitdataway_token():
+    """Mint an AccessToken. Returns (token, full_auth_response)."""
+    creds = base64.b64encode(f"{S('LEGITDATAWAY_USERNAME')}:{S('LEGITDATAWAY_PASSWORD')}".encode()).decode()
+    r = requests.post(LEGITDATAWAY_BASE + '/api/user',
+                      headers={'Authorization': f'Basic {creds}'}, timeout=30)
+    j = r.json()
+    tok = j.get('AccessToken')
+    if not tok:
+        raise RuntimeError('LegitDataWay auth failed: ' + str(j.get('status') or j)[:200])
+    return tok, j
+
+def legitdataway_post(path, payload):
+    tok, _ = legitdataway_token()
+    r = requests.post(LEGITDATAWAY_BASE + '/api' + path, json=payload,
+                      headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
+                      timeout=45)
+    return _provider_json(r, 'LegitDataWay')
+
+def legitdataway_get(path, params=None):
+    tok, _ = legitdataway_token()
+    r = requests.get(LEGITDATAWAY_BASE + '/api' + path, params=params,
+                     headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
+                     timeout=30)
+    return _provider_json(r, 'LegitDataWay')
+
+def lw_phone(phone):
+    """LegitDataWay's live API demands an 11-digit number, same as Bilal."""
+    return re.sub(r'\D', '', phone or '')
+
+def lw_sell_price(plan_id, cost):
+    """Sell price for a LegitDataWay plan: admin-set sell price, else cost + margin."""
+    rows = q("SELECT sell FROM legitdataway_plans WHERE plan_id=?", (plan_id,))
+    if rows and rows[0]['sell'] is not None:
+        return float(rows[0]['sell'])
+    margin = float((q("SELECT v FROM settings WHERE k='margin'") or [{'v': '0'}])[0]['v'])
+    return round(float(cost) * (1 + margin / 100), 2)
+
 def bl_phone(phone):
     """Bilal's live API demands an 11-digit number: its own error reply is
     'The phone must be 11 digits.' for 13-digit 234... numbers, even though
@@ -1047,6 +1120,52 @@ def debit_and_buy_bilal(user_id, amount, desc, tx_type, service, endpoint, bl_pa
     err_text = resp.get('message') or resp.get('error') or 'Purchase failed.'
     return _settle_wallet(user_id, ref, amount, ok, provider_ref, token, resp, err_text)
 
+
+def debit_and_buy_legitdataway(user_id, amount, desc, tx_type, service, endpoint, lw_payload, cost_price=None):
+    """Debit wallet, call LegitDataWay, refund on clear failure. Same guarantees
+    as debit_and_buy_bilal, with one LegitDataWay-specific rule: a LOST REPLY
+    (transport exception, no provider response at all) is NOT a failure — the
+    debit stays and the transaction stays pending, because LegitDataWay may
+    still deliver and its webhook (or the admin transaction-resolve endpoint)
+    settles it. Refunding a lost reply could double-spend if LegitDataWay
+    later delivers. Only an explicit provider 'fail' status refunds."""
+    ref, err = _debit_wallet(user_id, amount, desc, tx_type, service, cost_price)
+    if err:
+        return False, err
+    rid = request_id()
+    lw_payload = dict(lw_payload); lw_payload['request-id'] = rid
+    try:
+        resp = legitdataway_post(endpoint, lw_payload)
+        replied = True
+    except Exception as e:
+        resp = {'status': 'failed', 'message': str(e)}
+        replied = False
+    status = (resp.get('status') or '').lower()
+    provider_ref = resp.get('request-id') or resp.get('request_id') or rid
+    token = resp.get('token') or ''
+    if not replied or status == 'pending':
+        # No reply, or provider says pending: keep the debit, keep pending.
+        run("UPDATE transactions SET provider_ref=?, meta=? WHERE reference=?",
+            (provider_ref, json.dumps(resp)[:4000], ref))
+        msg = ('No reply from LegitDataWay yet. It stays pending until confirmed — check back shortly.'
+               if not replied else
+               'Purchase is processing at LegitDataWay. It stays pending until confirmed — check back shortly.')
+        return False, {'pending': True, 'reference': ref, 'error': msg}
+    ok = status in ('success', 'successful')
+    err_text = resp.get('message') or resp.get('error') or 'Purchase failed.'
+    ok, info = _settle_wallet(user_id, ref, amount, ok, provider_ref, token, resp, err_text)
+    if ok and tx_type == 'power':
+        # Electricity bills deduct amount + charges from the provider wallet
+        # (docs example: ₦300 bill, charges ₦21, balance drop ₦321). Record the
+        # true cost so profit stays exact instead of reading ₦0.
+        try:
+            charges = float(resp.get('charges') or 0)
+        except Exception:
+            charges = 0
+        if charges:
+            run("UPDATE transactions SET cost_price=? WHERE reference=?", (amount + charges, ref))
+    return ok, info
+
 # ---------------- public ----------------
 @app.get('/api/config')
 def config():
@@ -1054,6 +1173,7 @@ def config():
                     'sandbox': vt_sandbox(), 'live': True,
                     'provider': provider(), 'fatizara_ready': fatizara_configured(),
                     'bilal_ready': bilal_configured(),
+                    'legitdataway_ready': legitdataway_configured(),
                     'email_via': 'brevo' if S('BREVO_API_KEY') else 'smtp',
                     'email_ready': bool(S('BREVO_API_KEY') or (SMTP_USER and SMTP_APP_PASSWORD)),
                     'monnify_ready': monnify_configured(),
@@ -1812,6 +1932,15 @@ def buy_airtime():
             {'network': BILAL_NETWORKS[net], 'phone': bl_phone(phone),
              'plan_type': 'VTU', 'amount': amount, 'bypass': False})
         return jsonify({'ok': ok, **info})
+    if provider() == 'legitdataway':
+        if not legitdataway_configured():
+            return jsonify({'ok': False, 'error': 'LegitDataWay is not set up yet.'}), 503
+        ok, info = debit_and_buy_legitdataway(
+            g.user_id, amount, f'{net.upper()} airtime ₦{amount:,} → {phone}',
+            'airtime', net, '/topup',
+            {'network': LEGITDATAWAY_NETWORKS[net], 'phone': lw_phone(phone),
+             'plan_type': 'VTU', 'amount': amount, 'bypass': False})
+        return jsonify({'ok': ok, **info})
     ok, info = debit_and_buy(g.user_id, amount, f'{net.upper()} airtime ₦{amount:,} → {phone}',
                              'airtime', net,
                              {'serviceID': NETWORKS[net], 'amount': amount, 'phone': phone})
@@ -1837,6 +1966,15 @@ def data_plans():
         plans = [{'variation_code': r['plan_id'], 'name': r['name'],
                   'cost': float(r['cost'] or 0),
                   'price': bl_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
+        return jsonify({'ok': True, 'plans': plans})
+    if provider() == 'legitdataway':
+        # Same shape again (variation_code = LegitDataWay plan id), so the
+        # existing frontend works unchanged after the provider switch.
+        rows = q("SELECT plan_id, name, cost FROM legitdataway_plans "
+                 "WHERE service='data' AND network=? ORDER BY cost", (net,))
+        plans = [{'variation_code': r['plan_id'], 'name': r['name'],
+                  'cost': float(r['cost'] or 0),
+                  'price': lw_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
         return jsonify({'ok': True, 'plans': plans})
     svc = DATA_SVC.get(net, 'mtn-data')
     varis = vt_variations(svc)
@@ -1891,6 +2029,22 @@ def buy_data():
              'data_plan': int(code) if code.isdigit() else code, 'bypass': False},
             cost_price=cost)
         return jsonify({'ok': ok, **info})
+    if provider() == 'legitdataway':
+        if not legitdataway_configured():
+            return jsonify({'ok': False, 'error': 'LegitDataWay is not set up yet.'}), 503
+        rows = q("SELECT plan_id, name, cost FROM legitdataway_plans "
+                 "WHERE plan_id=? AND service='data' AND network=?", (code, net))
+        if not rows:
+            return jsonify({'ok': False, 'error': 'This plan is no longer available. Refresh plans.'}), 400
+        p = rows[0]
+        cost = float(p['cost'] or 0)
+        price = lw_sell_price(code, cost)
+        ok, info = debit_and_buy_legitdataway(
+            g.user_id, price, f"{p['name']} → {phone}", 'data', net, '/data',
+            {'network': LEGITDATAWAY_NETWORKS.get(net, 1), 'phone': phone,
+             'data_plan': int(code) if code.isdigit() else code, 'bypass': False},
+            cost_price=cost)
+        return jsonify({'ok': ok, **info})
     svc = DATA_SVC.get(net, 'mtn-data')
     varis = {v.get('variation_code'): v for v in vt_variations(svc)}
     if code not in varis:
@@ -1921,6 +2075,13 @@ def cable_plans():
         plans = [{'variation_code': r['plan_id'], 'name': r['name'],
                   'cost': float(r['cost'] or 0),
                   'price': bl_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
+        return jsonify({'ok': True, 'plans': plans})
+    if provider() == 'legitdataway':
+        rows = q("SELECT plan_id, name, cost FROM legitdataway_plans "
+                 "WHERE service='cable' AND network=? ORDER BY cost", (prov,))
+        plans = [{'variation_code': r['plan_id'], 'name': r['name'],
+                  'cost': float(r['cost'] or 0),
+                  'price': lw_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
         return jsonify({'ok': True, 'plans': plans})
     svc = CABLE_SVC.get(prov, 'dstv')
     varis = vt_variations(svc)
@@ -1957,6 +2118,30 @@ def verify():
                                  {'meter_number': billers,
                                   'disco': int(bl_disco) if str(bl_disco).isdigit() else bl_disco,
                                   'meter_type': vtype or 'prepaid'})
+                if (resp.get('status') or '').lower() in ('success', 'successful'):
+                    name = resp.get('customer_name') or resp.get('name') or ''
+                    return jsonify({'ok': True, 'customer': name, 'raw': resp})
+                return jsonify({'ok': False, 'error': 'Could not verify this meter. Check and try again.'}), 400
+        except Exception:
+            return jsonify({'ok': False, 'error': 'Verification service unreachable.'}), 502
+        return jsonify({'ok': False, 'error': 'Verification is not available for this service.'}), 400
+    if provider() == 'legitdataway':
+        if not legitdataway_configured():
+            return jsonify({'ok': False, 'error': 'LegitDataWay is not set up yet.'}), 503
+        try:
+            if service_id in CABLE_SVC and service_id != 'showmax':
+                resp = legitdataway_get('/cable/cable-validation',
+                                        {'iuc': billers, 'cable': LEGITDATAWAY_CABLES[service_id]})
+                if (resp.get('status') or '').lower() in ('success', 'successful') and resp.get('name'):
+                    return jsonify({'ok': True, 'customer': resp.get('name'), 'raw': resp})
+                return jsonify({'ok': False, 'error': 'Could not verify this number. Check and try again.'}), 400
+            rows = q("SELECT legitdataway_id FROM legitdataway_discos WHERE disco_key=?", (service_id,))
+            if rows:
+                lw_disco = rows[0]['legitdataway_id']
+                resp = legitdataway_get('/bill/bill-validation',
+                                        {'meter_number': billers,
+                                         'disco': int(lw_disco) if str(lw_disco).isdigit() else lw_disco,
+                                         'meter_type': vtype or 'prepaid'})
                 if (resp.get('status') or '').lower() in ('success', 'successful'):
                     name = resp.get('customer_name') or resp.get('name') or ''
                     return jsonify({'ok': True, 'customer': name, 'raw': resp})
@@ -2056,6 +2241,29 @@ def buy_cable():
              'iuc': billers, 'bypass': 0},
             cost_price=cost)
         return jsonify({'ok': ok, **info})
+    if provider() == 'legitdataway':
+        if not legitdataway_configured():
+            return jsonify({'ok': False, 'error': 'LegitDataWay is not set up yet.'}), 503
+        rows = q("SELECT plan_id, name, cost FROM legitdataway_plans "
+                 "WHERE plan_id=? AND service='cable' AND network=?", (code, prov))
+        if not rows:
+            return jsonify({'ok': False, 'error': 'This package is no longer available.'}), 400
+        p = rows[0]
+        cost = float(p['cost'] or 0)
+        price = lw_sell_price(code, cost)
+        # Seeded cable ids carry a 'c:' prefix (same collision guard as
+        # Bilal); LegitDataWay itself wants the plain numeric plan id.
+        # NOTE: whether /api/cable accepts the numeric id or a slug is
+        # unproven until a live test buy — see switch notes.
+        raw_plan = code[2:] if code.startswith('c:') else code
+        ok, info = debit_and_buy_legitdataway(
+            g.user_id, price, f"{prov.upper()} {p['name']} → {billers}",
+            'cable', prov, '/cable',
+            {'cablename': prov,
+             'cableplan': int(raw_plan) if raw_plan.isdigit() else raw_plan,
+             'smart_card_number': billers},
+            cost_price=cost)
+        return jsonify({'ok': ok, **info})
     varis = {v.get('variation_code'): v for v in vt_variations(svc)}
     if code not in varis:
         return jsonify({'ok': False, 'error': 'This package is no longer available.'}), 400
@@ -2080,6 +2288,12 @@ def discos():
         return jsonify({'ok': True, 'discos': out})
     if provider() == 'bilal':
         rows = q("SELECT disco_key, label FROM bilal_discos ORDER BY label")
+        out = [{'serviceID': r['disco_key'], 'label': r['label'],
+                'types': [{'variation_code': 'prepaid', 'name': 'Prepaid'},
+                          {'variation_code': 'postpaid', 'name': 'Postpaid'}]} for r in rows]
+        return jsonify({'ok': True, 'discos': out})
+    if provider() == 'legitdataway':
+        rows = q("SELECT disco_key, label FROM legitdataway_discos ORDER BY label")
         out = [{'serviceID': r['disco_key'], 'label': r['label'],
                 'types': [{'variation_code': 'prepaid', 'name': 'Prepaid'},
                           {'variation_code': 'postpaid', 'name': 'Postpaid'}]} for r in rows]
@@ -2132,6 +2346,20 @@ def buy_power():
             {'disco': int(bl_disco) if str(bl_disco).isdigit() else bl_disco,
              'meter_type': vtype,
              'meter_number': meter, 'amount': amount})
+        return jsonify({'ok': ok, **info})
+    if provider() == 'legitdataway':
+        if not legitdataway_configured():
+            return jsonify({'ok': False, 'error': 'LegitDataWay is not set up yet.'}), 503
+        rows = q("SELECT legitdataway_id FROM legitdataway_discos WHERE disco_key=?", (svc,))
+        if not rows:
+            return jsonify({'ok': False, 'error': 'This disco is not mapped yet.'}), 400
+        lw_disco = rows[0]['legitdataway_id']
+        ok, info = debit_and_buy_legitdataway(
+            g.user_id, amount, f'Electricity ₦{amount:,} ({vtype}) → {meter}',
+            'power', svc, '/bill',
+            {'disco': int(lw_disco) if str(lw_disco).isdigit() else lw_disco,
+             'meter_type': vtype,
+             'meter_number': meter, 'amount': amount, 'bypass': False})
         return jsonify({'ok': ok, **info})
     ok, info = debit_and_buy(g.user_id, amount, f'Electricity ₦{amount:,} ({vtype}) → {meter}',
                              'power', svc,
@@ -2515,6 +2743,378 @@ BILAL_DISCO_SEED = [
 BILAL_CATALOG_NETWORKS = {'MTN': 'mtn', 'AIRTEL': 'airtel', 'GLO': 'glo',
                           '9MOBILE': 'etisalat', 'T2': 'etisalat'}
 BILAL_CATALOG_CABLES = {'DSTV': 'dstv', 'GOTV': 'gotv', 'STARTIMES': 'startimes'}
+
+
+# ---------------- LegitDataWay admin ----------------
+# NOTE: Yola=9, Benin=10 here — swapped vs Bilal. Do not "fix" to Bilal's order.
+LEGITDATAWAY_DISCO_SEED = [
+    ('ikeja-electric', 1, 'Ikeja Electric (IKEDC)'),
+    ('eko-electric', 2, 'Eko Electric (EKEDC)'),
+    ('kano-electric', 3, 'Kano Electric (KEDCO)'),
+    ('portharcourt-electric', 4, 'PH Electric (PHEDC)'),
+    ('jos-electric', 5, 'Jos Electric (JEDC)'),
+    ('ibadan-electric', 6, 'Ibadan Electric (IBEDC)'),
+    ('kaduna-electric', 7, 'Kaduna Electric (KAEDC)'),
+    ('abuja-electric', 8, 'Abuja Electric (AEDC)'),
+    ('yola-electric', 9, 'Yola Electric (YEDC)'),
+    ('benin-electric', 10, 'Benin Electric (BEDC)'),
+]
+LW_DATA_SEED = [
+    ('244', 'airtel', '250MB GIFTING 1 day', 50.0, 100.0),
+    ('242', 'airtel', '75MB GIFTING 1 day', 74.0, 124.0),
+    ('243', 'airtel', '110MB GIFTING 1 day', 98.0, 148.0),
+    ('326', 'airtel', '1.2GB COOPERATE GIFTING 7days', 192.0, 242.0),
+    ('247', 'airtel', '600MB GIFTING 2 days', 205.0, 255.0),
+    ('327', 'airtel', '2GB COOPERATE GIFTING 7days', 288.0, 338.0),
+    ('233', 'airtel', '1GB GIFTING 3 days', 290.0, 340.0),
+    ('241', 'airtel', '1.5GB GIFTING 1 day', 405.0, 455.0),
+    ('328', 'airtel', '3.2GB COOPERATE GIFTING 7days', 480.0, 530.0),
+    ('329', 'airtel', '3.2GB COOPERATE GIFTING 30days', 480.0, 530.0),
+    ('235', 'airtel', '500MB GIFTING 7 days', 490.0, 540.0),
+    ('238', 'airtel', '1.5GB GIFTING 7 days', 490.0, 540.0),
+    ('240', 'airtel', '1.5GB GIFTING 1 day', 505.0, 555.0),
+    ('245', 'airtel', '2GB GIFTING 7 days', 570.0, 620.0),
+    ('237', 'airtel', '3GB GIFTING 2 days', 735.0, 785.0),
+    ('232', 'airtel', '1GB GIFTING 7 days', 780.0, 830.0),
+    ('330', 'airtel', '6.5GB COOPERATE GIFTING 14days', 960.0, 1010.0),
+    ('239', 'airtel', '1.5GB GIFTING 7 days', 980.0, 1030.0),
+    ('234', 'airtel', '2GB GIFTING 30 days', 1425.0, 1475.0),
+    ('250', 'airtel', '5GB GIFTING 7 days', 1470.0, 1520.0),
+    ('236', 'airtel', '3GB GIFTING 30 days', 1960.0, 2010.0),
+    ('248', 'airtel', '3GB GIFTING 30 days', 1960.0, 2010.0),
+    ('296', 'airtel', '8GB GIFTING 30 days. ebony', 1960.0, 2010.0),
+    ('249', 'airtel', '4GB GIFTING 30 days', 2450.0, 2500.0),
+    ('331', 'airtel', '20GB COOPERATE GIFTING 30 days', 2880.0, 2930.0),
+    ('251', 'airtel', '8GB GIFTING 30 days', 2970.0, 3020.0),
+    ('231', 'airtel', '10GB GIFTING 30 days', 3000.0, 3050.0),
+    ('252', 'airtel', '10GB GIFTING 30 days', 3920.0, 3970.0),
+    ('253', 'airtel', '13GB GIFTING 30 days', 4900.0, 4950.0),
+    ('254', 'airtel', '25GB GIFTING 30 days', 7840.0, 7890.0),
+    ('255', 'airtel', '35GB GIFTING 30 days', 9800.0, 9850.0),
+    ('297', 'airtel', '60GB GIFTING 1 year. Ebony plan', 9800.0, 9850.0),
+    ('256', 'airtel', '60GB GIFTING 30 days', 14700.0, 14750.0),
+    ('257', 'airtel', '100GB GIFTING 30 days', 19600.0, 19650.0),
+    ('258', 'airtel', '300GB GIFTING 90 days', 49000.0, 49050.0),
+    ('259', 'airtel', '350GB GIFTING 120 days', 58800.0, 58850.0),
+    ('260', 'airtel', '685GB GIFTING 1 year', 98000.0, 98050.0),
+    ('85', 'etisalat', '500MB COOPERATE GIFTING 30days', 250.0, 300.0),
+    ('61', 'etisalat', '1.1GB SME 30 days', 400.0, 450.0),
+    ('69', 'etisalat', '500MB GIFTING 30days', 450.0, 500.0),
+    ('86', 'etisalat', '1GB COOPERATE GIFTING 30days', 500.0, 550.0),
+    ('62', 'etisalat', '2GB SME 30 days', 800.0, 850.0),
+    ('68', 'etisalat', '1.5GB GIFTING 30 days', 880.0, 930.0),
+    ('87', 'etisalat', '2GB COOPERATE GIFTING 30days', 1000.0, 1050.0),
+    ('88', 'etisalat', '3GB COOPERATE GIFTING 30days', 1500.0, 1550.0),
+    ('89', 'etisalat', '4GB COOPERATE GIFTING 30days', 2000.0, 2050.0),
+    ('90', 'etisalat', '5GB COOPERATE GIFTING 30days', 2500.0, 2550.0),
+    ('91', 'etisalat', '10GB COOPERATE GIFTING 30days', 5000.0, 5050.0),
+    ('298', 'glo', '45MB GIFTING 1 day', 45.0, 95.0),
+    ('70', 'glo', '200MB COOPERATE GIFTING 30days', 90.0, 140.0),
+    ('299', 'glo', '100MB GIFTING 1 day', 98.0, 148.0),
+    ('300', 'glo', '200MB GIFTING 2 days', 196.0, 246.0),
+    ('71', 'glo', '500MB COOPERATE GIFTING 30days', 200.0, 250.0),
+    ('220', 'glo', '500MB SME 14 days', 205.0, 255.0),
+    ('301', 'glo', '1.5GB GIFTING 1 day', 294.0, 344.0),
+    ('222', 'glo', '1GB SME 3 days', 345.0, 395.0),
+    ('221', 'glo', '1GB SME 14 days', 360.0, 410.0),
+    ('223', 'glo', '1GB SME 7 days', 360.0, 410.0),
+    ('72', 'glo', '1GB COOPERATE GIFTING 30 days', 410.0, 460.0),
+    ('303', 'glo', '2.5GB GIFTING 2 days', 490.0, 540.0),
+    ('304', 'glo', '1.5GB GIFTING 7 days', 490.0, 540.0),
+    ('302', 'glo', '3GB GIFTING 2 days', 735.0, 785.0),
+    ('73', 'glo', '2GB COOPERATE GIFTING 30days', 830.0, 880.0),
+    ('305', 'glo', '2.6GB GIFTING 30 days', 980.0, 1030.0),
+    ('224', 'glo', '3GB SME 3 days', 1030.0, 1080.0),
+    ('225', 'glo', '3GB SME 7 days', 1071.0, 1121.0),
+    ('226', 'glo', '3GB SME 14 days', 1071.0, 1121.0),
+    ('74', 'glo', '3GB COOPERATE GIFTING 30 days', 1245.0, 1295.0),
+    ('306', 'glo', '5GB GIFTING 30 days', 1470.0, 1520.0),
+    ('227', 'glo', '5GB SME 3 days', 1700.0, 1750.0),
+    ('228', 'glo', '5GB SME 7 days', 1780.0, 1830.0),
+    ('229', 'glo', '5GB SME 14 days', 1780.0, 1830.0),
+    ('307', 'glo', '6.15GB GIFTING 30 days', 1960.0, 2010.0),
+    ('75', 'glo', '5GB COOPERATE GIFTING 30days', 2075.0, 2125.0),
+    ('308', 'glo', '7.25GB GIFTING 30 days', 2450.0, 2500.0),
+    ('309', 'glo', '10GB GIFTING 30 days', 2940.0, 2990.0),
+    ('230', 'glo', '10GB SME 14 days', 3560.0, 3610.0),
+    ('310', 'glo', '12.5GB GIFTING 30 days', 3920.0, 3970.0),
+    ('76', 'glo', '10GB COOPERATE GIFTING 30days', 4150.0, 4200.0),
+    ('311', 'glo', '16GB GIFTING 30 days', 4900.0, 4950.0),
+    ('312', 'glo', '20GB GIFTING 30 days', 5880.0, 5930.0),
+    ('314', 'glo', '28GB GIFTING 30 days', 7840.0, 7890.0),
+    ('262', 'mtn', '75MB GIFTING 1 day', 73.5, 123.5),
+    ('46', 'mtn', '1GB COOPERATE GIFTING 24 hours', 250.0, 300.0),
+    ('322', 'mtn', '1GB COOPERATE GIFTING 30 days', 270.0, 320.0),
+    ('36', 'mtn', '500MB SME 30 days', 300.0, 350.0),
+    ('265', 'mtn', '500MB GIFTING 1 day', 343.0, 393.0),
+    ('315', 'mtn', '1GB SME 30 days', 400.0, 450.0),
+    ('37', 'mtn', '1GB SME 7 days', 400.0, 450.0),
+    ('323', 'mtn', '2GB COOPERATE GIFTING 30 days', 470.0, 520.0),
+    ('266', 'mtn', '1GB GIFTING 1 day', 490.0, 540.0),
+    ('267', 'mtn', '1.5GB GIFTING 2 days', 588.0, 638.0),
+    ('324', 'mtn', '3GB COOPERATE GIFTING 30 days', 690.0, 740.0),
+    ('268', 'mtn', '2GB GIFTING 2 days', 735.0, 785.0),
+    ('38', 'mtn', '2GB SME 30 days', 760.0, 810.0),
+    ('269', 'mtn', '2.5GB GIFTING 2 days', 882.0, 932.0),
+    ('270', 'mtn', '3.2GB GIFTING 2 days', 980.0, 1030.0),
+    ('39', 'mtn', '3GB SME 30 days', 1110.0, 1160.0),
+    ('325', 'mtn', '5GB COOPERATE GIFTING 30 days', 1400.0, 1450.0),
+    ('271', 'mtn', '2GB GIFTING 30days', 1470.0, 1520.0),
+    ('274', 'mtn', '3.5GB GIFTING 7 days', 1470.0, 1520.0),
+    ('275', 'mtn', '1.8GB GIFTING 30 days', 1470.0, 1520.0),
+    ('40', 'mtn', '5GB SME 30 days', 1660.0, 1710.0),
+    ('277', 'mtn', '7GB GIFTING 2 days', 1764.0, 1814.0),
+    ('272', 'mtn', '2.7GB GIFTING 30 days', 1960.0, 2010.0),
+    ('273', 'mtn', '3.5GB GIFTING 30 days', 2450.0, 2500.0),
+    ('278', 'mtn', '5.5GB GIFTING 30 days', 2940.0, 2990.0),
+    ('276', 'mtn', '7GB GIFTING 30 days', 3430.0, 3480.0),
+    ('280', 'mtn', '11GB GIFTING 7 days', 3430.0, 3480.0),
+    ('279', 'mtn', '10GB GIFTING 30 days', 4410.0, 4460.0),
+    ('282', 'mtn', '14.5GB GIFTING 30 days', 4900.0, 4950.0),
+    ('281', 'mtn', '12.5GB GIFTING 30 days', 5390.0, 5440.0),
+    ('283', 'mtn', '16.5GB GIFTING 30 days', 6370.0, 6420.0),
+    ('285', 'mtn', '25GB GIFTING 30 days', 6860.0, 6910.0),
+    ('284', 'mtn', '20GB GIFTING 30 days', 7350.0, 7400.0),
+    ('286', 'mtn', '25GB GIFTING 30 days', 8820.0, 8870.0),
+    ('289', 'mtn', '40GB GIFTING 60 days', 8820.0, 8870.0),
+    ('287', 'mtn', '34GB GIFTING 30 days', 9800.0, 9850.0),
+    ('288', 'mtn', '36GB GIFTING 30 days', 10780.0, 10830.0),
+    ('290', 'mtn', '65GB GIFTING 30 days', 15680.0, 15730.0),
+    ('291', 'mtn', '75GB GIFTING 30 days', 17600.0, 17650.0),
+    ('292', 'mtn', '90GB GIFTING 60days', 24500.0, 24550.0),
+    ('293', 'mtn', '165GB GIFTING 30 days', 34300.0, 34350.0),
+    ('294', 'mtn', '250GB GIFTING 30 days', 53900.0, 53950.0),
+    ('295', 'mtn', '800GB GIFTING 1 year', 122500.0, 122550.0),
+]
+
+LW_CABLE_SEED = [
+    ('c:28', 'dstv', 'DStv HDPVR Access Service', 2500.0, 2500.0),
+    ('c:94', 'dstv', 'Great wall standalone bouquet', 3800.0, 3800.0),
+    ('c:1', 'dstv', 'DStv Padi', 4400.0, 4400.0),
+    ('c:107', 'dstv', 'Yanga OTT Streaming subscription', 5100.0, 5100.0),
+    ('c:87', 'dstv', 'Yanga', 6000.0, 6000.0),
+    ('c:111', 'dstv', 'Yanga', 6000.0, 6000.0),
+    ('c:32', 'dstv', 'ExtraView Access', 6050.0, 6050.0),
+    ('c:2', 'dstv', 'DSTV -YANGA', 6100.0, 6100.0),
+    ('c:110', 'dstv', 'Confam streaming subscription', 7450.0, 7450.0),
+    ('c:31', 'dstv', 'DStv French Touch Add-on', 7500.0, 7500.0),
+    ('c:96', 'dstv', 'Yanga + showmax', 8250.0, 8250.0),
+    ('c:97', 'dstv', 'Great wall standalone bouquet + showmax', 8300.0, 8300.0),
+    ('c:101', 'dstv', 'Padi + showmax', 8900.0, 8900.0),
+    ('c:34', 'dstv', 'Dstv Confam', 9300.0, 9300.0),
+    ('c:43', 'dstv', 'DStv Padi + ExtraView', 10400.0, 10400.0),
+    ('c:33', 'dstv', 'DStv French 11', 11000.0, 11000.0),
+    ('c:112', 'dstv', 'Confam', 11000.0, 11000.0),
+    ('c:121', 'dstv', 'Confam streaming subscription', 11000.0, 11000.0),
+    ('c:42', 'dstv', 'DStv Yanga + ExtraView', 12100.0, 12100.0),
+    ('c:30', 'dstv', 'DStv Asian Add-on', 12400.0, 12400.0),
+    ('c:109', 'dstv', 'Streaming subscription', 12550.0, 12550.0),
+    ('c:99', 'dstv', 'Confam + showmax', 13250.0, 13250.0),
+    ('c:118', 'dstv', 'Asia addon', 14900.0, 14900.0),
+    ('c:122', 'dstv', 'DStv indian', 14900.0, 14900.0),
+    ('c:6', 'dstv', 'DStv Asia', 15000.0, 15000.0),
+    ('c:35', 'dstv', 'Compact', 15700.0, 15700.0),
+    ('c:41', 'dstv', 'DStv Confam + ExtraView', 17100.0, 17100.0),
+    ('c:4', 'dstv', 'DStv Compact', 19000.0, 19000.0),
+    ('c:88', 'dstv', 'Compact', 19000.0, 19000.0),
+    ('c:120', 'dstv', 'Compact streaming', 19000.0, 19000.0),
+    ('c:29', 'dstv', 'DStv French Plus Add-on', 24500.0, 24500.0),
+    ('c:14', 'dstv', 'DStv Compact + Extra View', 25100.0, 25100.0),
+    ('c:15', 'dstv', 'DStv Compact + French Touch', 26100.0, 26100.0),
+    ('c:108', 'dstv', 'Compact plus streaming subscription', 30000.0, 30000.0),
+    ('c:38', 'dstv', 'DStv Compact Plus', 31000.0, 31000.0),
+    ('c:91', 'dstv', 'Compact + French Touch + ExtraView', 32000.0, 32000.0),
+    ('c:18', 'dstv', 'DStv Compact + French Touch + ExtraView', 32200.0, 32200.0),
+    ('c:98', 'dstv', 'Compact plus + showmax', 32250.0, 32250.0),
+    ('c:100', 'dstv', 'Compact + showmax', 32250.0, 32250.0),
+    ('c:49', 'dstv', 'DStv Compact + Asia + ExtraView', 33100.0, 33100.0),
+    ('c:13', 'dstv', 'DStv Compact + Asia', 34000.0, 34000.0),
+    ('c:22', 'dstv', 'DStv Compact Plus + Extra View', 36000.0, 36000.0),
+    ('c:21', 'dstv', 'DStv Compact Plus + French Touch', 37000.0, 37000.0),
+    ('c:92', 'dstv', 'Compact plus + French Touch', 37000.0, 37000.0),
+    ('c:105', 'dstv', 'DStv Premium Streaming subscription', 37000.0, 37000.0),
+    ('c:48', 'dstv', 'DStv Compact Plus - Asia', 37400.0, 37400.0),
+    ('c:19', 'dstv', 'DStv Compact + Asia + ExtraView', 40000.0, 40000.0),
+    ('c:25', 'dstv', 'DStv Compact Plus + Asia + ExtraView', 42400.0, 42400.0),
+    ('c:24', 'dstv', 'DStv Compact + French Plus', 43700.0, 43700.0),
+    ('c:44', 'dstv', 'DStv Compact + Asia', 44000.0, 44000.0),
+    ('c:104', 'dstv', 'Premium + showmax', 44500.0, 44500.0),
+    ('c:5', 'dstv', 'DStv Premium', 44700.0, 44700.0),
+    ('c:17', 'dstv', 'DStv Compact Plus + Asia', 45000.0, 45000.0),
+    ('c:83', 'dstv', 'Premium', 45000.0, 45000.0),
+    ('c:90', 'dstv', 'Premium + Extra View', 50500.0, 50500.0),
+    ('c:102', 'dstv', 'Premium + Asia + showmax', 50500.0, 50500.0),
+    ('c:9', 'dstv', 'DStv Premium-Asia', 51000.0, 51000.0),
+    ('c:26', 'dstv', 'DStv Premium + Asia + Extra View', 54400.0, 54400.0),
+    ('c:20', 'dstv', 'DStv Compact Plus + French Plus', 55000.0, 55000.0),
+    ('c:16', 'dstv', 'DStv Premium - Extra View', 55700.0, 55700.0),
+    ('c:23', 'dstv', 'DStv Compact Plus + FrenchPlus + Extra View', 61000.0, 61000.0),
+    ('c:84', 'dstv', 'Premium-french', 69000.0, 69000.0),
+    ('c:89', 'dstv', 'Premium-french', 69000.0, 69000.0),
+    ('c:103', 'dstv', 'Premium + French + showmax', 69000.0, 69000.0),
+    ('c:27', 'dstv', 'DStv Premium + French + Extra View', 75000.0, 75000.0),
+    ('c:106', 'dstv', 'Prestige', 590200.0, 590200.0),
+    ('c:119', 'dstv', 'Prestige', 850000.0, 850000.0),
+    ('c:62', 'gotv', 'GOtv Smallie - monthly', 1900.0, 1900.0),
+    ('c:61', 'gotv', 'GOtv Jinja', 3900.0, 3900.0),
+    ('c:63', 'gotv', 'GOtv Smallie - quarterly', 5100.0, 5100.0),
+    ('c:60', 'gotv', 'GOtv Jolli', 5800.0, 5800.0),
+    ('c:59', 'gotv', 'GOtv Max', 8500.0, 8500.0),
+    ('c:65', 'gotv', 'GOtv Supa - monthly', 11400.0, 11400.0),
+    ('c:64', 'gotv', 'GOtv Smallie - yearly', 15000.0, 15000.0),
+    ('c:123', 'gotv', 'Gotv Supa Plus - Monthly', 16900.0, 16900.0),
+    ('c:81', 'startime', 'Nova 1day', 150.0, 150.0),
+    ('c:71', 'startime', 'Nova - 1 Week', 700.0, 700.0),
+    ('c:116', 'startime', 'Nova (dish) 1 week', 700.0, 700.0),
+    ('c:72', 'startime', 'Basic (Antenna) - 1 Week', 1400.0, 1400.0),
+    ('c:74', 'startime', 'Classic (Antenna) - 1 Week', 2000.0, 2000.0),
+    ('c:66', 'startime', 'Nova - 1 Month', 2100.0, 2100.0),
+    ('c:114', 'startime', 'Special (dish) 1 week', 2100.0, 2100.0),
+    ('c:117', 'startime', 'Super (antenna) 1 week', 3200.0, 3200.0),
+    ('c:75', 'startime', 'Super (Dish) - 1 Week', 3300.0, 3300.0),
+    ('c:67', 'startime', 'Basic (Antenna) - 1 Month', 4000.0, 4000.0),
+    ('c:115', 'startime', 'Special (dish) 1 month', 5600.0, 5600.0),
+    ('c:69', 'startime', 'Classic (Antenna) - 1 Month', 6000.0, 6000.0),
+    ('c:70', 'startime', 'Super (Dish) - 1 Month', 9800.0, 9800.0),
+    ('c:113', 'startime', 'Chinese 1 month', 16000.0, 16000.0),
+]
+@app.get('/api/admin/legitdataway-plans')
+@admin_session_auth
+def legitdataway_plans_admin():
+    return jsonify({'ok': True, 'plans': q("SELECT * FROM legitdataway_plans ORDER BY service, network, cost")})
+
+@app.post('/api/admin/legitdataway-plan')
+@admin_session_auth
+def legitdataway_plan_save():
+    d = request.get_json(force=True, silent=True) or {}
+    plan_id = (d.get('plan_id') or '').strip()
+    service = (d.get('service') or '').strip()
+    network = (d.get('network') or '').strip()
+    name = (d.get('name') or '').strip()
+    if not plan_id or service not in ('data', 'cable') or not name:
+        return jsonify({'ok': False, 'error': 'plan_id, service (data/cable) and name are required.'}), 400
+    try: cost = float(d.get('cost'))
+    except Exception: return jsonify({'ok': False, 'error': 'Enter a valid cost.'}), 400
+    sell = d.get('sell')
+    try: sell = None if sell in (None, '') else float(sell)
+    except Exception: return jsonify({'ok': False, 'error': 'Enter a valid sell price.'}), 400
+    run("""INSERT INTO legitdataway_plans(plan_id,service,network,name,cost,sell,updated)
+           VALUES(?,?,?,?,?,?,?)
+           ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
+           network=excluded.network, name=excluded.name, cost=excluded.cost,
+           sell=excluded.sell, updated=excluded.updated""",
+        (plan_id, service, network, name, cost, sell, now_iso()))
+    log_admin('price_save', f'LegitDataWay {service}/{network} {name}: cost {cost}, sell {sell}')
+    return jsonify({'ok': True})
+
+@app.get('/api/admin/legitdataway-discos')
+@admin_session_auth
+def legitdataway_discos_admin():
+    return jsonify({'ok': True, 'discos': q("SELECT * FROM legitdataway_discos ORDER BY label")})
+
+@app.post('/api/admin/legitdataway-disco')
+@admin_session_auth
+def legitdataway_disco_save():
+    d = request.get_json(force=True, silent=True) or {}
+    disco_key = (d.get('disco_key') or '').strip()
+    lw_id = (d.get('legitdataway_id') or '').strip()
+    label = (d.get('label') or '').strip()
+    if not disco_key or not lw_id or not label:
+        return jsonify({'ok': False, 'error': 'disco_key, legitdataway_id and label are required.'}), 400
+    run("""INSERT INTO legitdataway_discos(disco_key,legitdataway_id,label,updated)
+           VALUES(?,?,?,?)
+           ON CONFLICT(disco_key) DO UPDATE SET legitdataway_id=excluded.legitdataway_id,
+           label=excluded.label, updated=excluded.updated""",
+        (disco_key, lw_id, label, now_iso()))
+    return jsonify({'ok': True})
+
+@app.get('/api/admin/legitdataway-cost-check')
+@admin_session_auth
+def legitdataway_cost_check():
+    """Plans whose sell price sits below LegitDataWay cost — same idea as cost-check."""
+    out = []
+    for r in q("SELECT plan_id, service, network, name, cost, sell FROM legitdataway_plans"):
+        cost = float(r['cost'] or 0)
+        sell = lw_sell_price(r['plan_id'], cost)
+        if sell < cost:
+            out.append({'plan': r['name'], 'code': r['plan_id'], 'service': r['service'],
+                        'cost': cost, 'sell': sell, 'loss': round(cost - sell, 2)})
+    return jsonify({'ok': True, 'losing': out})
+
+def legitdataway_seed_data():
+    """Seed discos + plans from the docs/dashboard tables captured 2026-11-03.
+    Data sell = cost + ₦50 (Mahmod's rule); cable sell = cost (at cost).
+    Vitel data plans are NOT seeded: LegitDataWay docs give them no network id.
+    Safe to re-run: updates cost/name, never overwrites an admin-set sell price."""
+    n_discos = 0
+    for disco_key, lw_id, label in LEGITDATAWAY_DISCO_SEED:
+        run("""INSERT INTO legitdataway_discos(disco_key,legitdataway_id,label,updated)
+               VALUES(?,?,?,?)
+               ON CONFLICT(disco_key) DO UPDATE SET legitdataway_id=excluded.legitdataway_id,
+               label=excluded.label, updated=excluded.updated""",
+            (disco_key, str(lw_id), label, now_iso()))
+        n_discos += 1
+    n_plans = 0
+    for plan_id, net, name, cost, sell in LW_DATA_SEED:
+        run("""INSERT INTO legitdataway_plans(plan_id,service,network,name,cost,sell,updated)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
+               network=excluded.network, name=excluded.name, cost=excluded.cost,
+               updated=excluded.updated""",
+            (plan_id, 'data', net, name, cost, sell, now_iso()))
+        n_plans += 1
+    for plan_id, net, name, cost, sell in LW_CABLE_SEED:
+        run("""INSERT INTO legitdataway_plans(plan_id,service,network,name,cost,sell,updated)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(plan_id) DO UPDATE SET service=excluded.service,
+               network=excluded.network, name=excluded.name, cost=excluded.cost,
+               updated=excluded.updated""",
+            (plan_id, 'cable', net, name, cost, sell, now_iso()))
+        n_plans += 1
+    return n_plans, n_discos
+
+@app.post('/api/admin/legitdataway-seed-plans')
+@admin_session_auth
+def legitdataway_seed_plans():
+    n_plans, n_discos = legitdataway_seed_data()
+    return jsonify({'ok': True, 'plans': n_plans, 'discos': n_discos,
+                    'note': 'LegitDataWay plans seeded from docs tables. Data sells at cost + ₦50, cable at cost.'})
+
+@app.post('/api/legitdataway/webhook')
+def legitdataway_webhook():
+    """LegitDataWay transaction-status callback. No signature is documented,
+    so the only trust anchors are the request-id itself (timestamp + 12 random
+    hex chars, unguessable) and the rule that ONLY pending transactions move:
+    success marks delivered, fail refunds via the admin-resolve pattern.
+    Anything else is ignored."""
+    d = request.get_json(force=True, silent=True) or {}
+    rid = d.get('request-id') or d.get('request_id') or ''
+    status = (d.get('status') or '').lower()
+    if not rid or status not in ('success', 'fail'):
+        return jsonify({'ok': False}), 400
+    rows = q("SELECT user_id, amount, reference FROM transactions WHERE provider_ref=? AND status='pending'", (rid,))
+    if not rows:
+        return jsonify({'ok': True, 'note': 'no pending transaction'}), 200
+    t = rows[0]
+    con = db()
+    try:
+        if USE_PG:
+            cur = con.cursor()
+            if status == 'fail':
+                cur.execute("UPDATE users SET wallet=wallet+%s WHERE id=%s", (t['amount'], t['user_id']))
+            cur.execute("UPDATE transactions SET status=%s, meta=%s WHERE reference=%s",
+                        ('successful' if status == 'success' else 'failed', json.dumps(d)[:4000], t['reference']))
+            con.commit(); cur.close()
+        else:
+            if status == 'fail':
+                con.execute("UPDATE users SET wallet=wallet+? WHERE id=?", (t['amount'], t['user_id']))
+            con.execute("UPDATE transactions SET status=?, meta=? WHERE reference=?",
+                        ('successful' if status == 'success' else 'failed', json.dumps(d)[:4000], t['reference']))
+            con.commit()
+    finally:
+        if not USE_PG: con.close()
+    log_admin('lw_webhook', f"{t['reference']} -> {status} via LegitDataWay webhook")
+    return jsonify({'ok': True})
 
 @app.post('/api/admin/bilal-seed-plans')
 @admin_session_auth
