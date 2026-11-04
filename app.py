@@ -1569,7 +1569,10 @@ def _power_token_from_meta(meta):
         for key in ('token', 'electricity_token', 'token_code', 'pin'):
             v = node.get(key)
             if v:
-                return str(v).strip()
+                # Providers (Bilal) prefix the value with a "Token :" label;
+                # the receipt box already labels it, so drop the redundant
+                # prefix to keep the token on one short line.
+                return re.sub(r'^token\s*:\s*', '', str(v).strip(), flags=re.I)
     return ''
 
 @app.get('/api/history')
