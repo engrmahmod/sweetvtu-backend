@@ -1549,12 +1549,44 @@ def logout():
 def me():
     return jsonify({'ok': True, 'user': get_user(g.user_id)})
 
+def _power_token_from_meta(meta):
+    """Extract a prepaid electricity token from a stored transaction meta blob.
+    Sync-settled buys store {'token': ..., 'raw': ...}; webhook-settled buys
+    store the raw webhook payload, which may carry the token at top level or
+    under 'data'. Returns '' when no token is on file (e.g. postpaid bills,
+    which have no token at all)."""
+    try:
+        m = json.loads(meta) if isinstance(meta, str) else (meta or {})
+    except Exception:
+        return ''
+    if not isinstance(m, dict):
+        return ''
+    raw = m.get('raw') if isinstance(m.get('raw'), dict) else {}
+    for node in (m, raw, raw.get('data') if isinstance(raw.get('data'), dict) else {},
+                 m.get('data') if isinstance(m.get('data'), dict) else {}):
+        if not isinstance(node, dict):
+            continue
+        for key in ('token', 'electricity_token', 'token_code', 'pin'):
+            v = node.get(key)
+            if v:
+                return str(v).strip()
+    return ''
+
 @app.get('/api/history')
 @auth
 def history():
-    rows = q("""SELECT type,service,description,amount,direction,status,reference,created
+    rows = q("""SELECT type,service,description,amount,direction,status,reference,created,meta
                 FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 100""", (g.user_id,))
-    return jsonify({'ok': True, 'transactions': rows})
+    out = []
+    for r in rows:
+        d = dict(r)
+        meta = d.pop('meta', None)
+        if d.get('type') == 'power':
+            tok = _power_token_from_meta(meta)
+            if tok:
+                d['token'] = tok
+        out.append(d)
+    return jsonify({'ok': True, 'transactions': out})
 
 # ---------------- wallet funding (Paystack) ----------------
 @app.post('/api/fund/initialize')
