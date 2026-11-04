@@ -58,6 +58,9 @@ SETTINGS_META = {
     'BREVO_SENDER':       dict(group='Email',    label='Sender email', secret=False),
     'PAYSTACK_SECRET_KEY': dict(group='Paystack', label='Secret Key',  secret=True),
     'PAYSTACK_PUBLIC_KEY': dict(group='Paystack', label='Public Key',  secret=False),
+    'MANUAL_BANK':         dict(group='Manual funding', label='Bank', secret=False),
+    'MANUAL_ACCOUNT_NUMBER': dict(group='Manual funding', label='Account number', secret=False),
+    'MANUAL_ACCOUNT_NAME': dict(group='Manual funding', label='Account name', secret=False),
 }
 SETTINGS_ALLOW = set(SETTINGS_META)
 
@@ -523,6 +526,13 @@ def init_db():
         pass
     if not q("SELECT v FROM settings WHERE k='margin'"):
         run("INSERT INTO settings(k,v) VALUES('margin','0')")
+    # Manual funding account shown on Fund Wallet; the admin can change
+    # these in Connections. Seed only when missing, never overwrite edits.
+    for _k, _v in (('MANUAL_BANK', 'Moniepoint'),
+                   ('MANUAL_ACCOUNT_NUMBER', '9066336666'),
+                   ('MANUAL_ACCOUNT_NAME', 'Uxbridge Supply & Construction')):
+        if not q("SELECT v FROM settings WHERE k=?", (_k,)):
+            run("INSERT INTO settings(k,v) VALUES(?,?)", (_k, _v))
 
 init_db()
 
@@ -1691,6 +1701,20 @@ def monnify_token():
 def monnify_status():
     return jsonify({'ok': True, 'configured': monnify_configured(),
                     'sandbox': monnify_sandbox()})
+
+@app.get('/api/manual-funding')
+@auth
+def manual_funding():
+    """Manual funding account shown on Fund Wallet. The admin edits these
+    details in Connections; the shop reads them live on every Fund Wallet
+    open, so an admin edit shows immediately."""
+    bank = S('MANUAL_BANK')
+    number = S('MANUAL_ACCOUNT_NUMBER')
+    name = S('MANUAL_ACCOUNT_NAME')
+    if not (bank and number and name):
+        return jsonify({'ok': False, 'error': 'Manual funding is not set up yet.'})
+    return jsonify({'ok': True, 'bank': bank, 'account_number': number,
+                    'account_name': name})
 
 @app.post('/api/fund-account')
 @limiter.limit('20 per minute')
