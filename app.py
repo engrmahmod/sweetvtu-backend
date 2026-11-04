@@ -449,7 +449,8 @@ def init_db():
                      ("xpouch_ref TEXT", "users"), ("xpouch_acct TEXT", "users"),
                      ("xpouch_bank TEXT", "users"), ("xpouch_acct_name TEXT", "users"),
                      ("cost_price REAL", "transactions"),
-                     ("updated_at TEXT", "settings")):
+                     ("updated_at TEXT", "settings"),
+                     ("hidden INTEGER DEFAULT 0", "legitdataway_plans")):
         try:
             run(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except Exception:
@@ -483,6 +484,20 @@ def init_db():
             REF_COL_READY = 'referred_by' in cols
     except Exception:
         REF_COL_READY = False
+    # Plan on/off switches: same pattern — the hidden column gates the
+    # shop filter, so a worker where the ALTER has not landed keeps
+    # showing every plan instead of breaking the data page.
+    global LW_HIDDEN_READY
+    try:
+        if USE_PG:
+            rows = q("SELECT column_name FROM information_schema.columns "
+                     "WHERE table_name='legitdataway_plans' AND column_name='hidden'")
+            LW_HIDDEN_READY = len(rows) > 0
+        else:
+            cols = [r['name'] for r in q("PRAGMA table_info(legitdataway_plans)")]
+            LW_HIDDEN_READY = 'hidden' in cols
+    except Exception:
+        LW_HIDDEN_READY = False
     # New security columns are migrated separately (non-blocking) so a
     # locked ALTER can never hang the deploy. See _try_security_migration().
     _try_security_migration()
@@ -2430,8 +2445,13 @@ def data_plans():
     if provider() == 'legitdataway':
         # Same shape again (variation_code = LegitDataWay plan id), so the
         # existing frontend works unchanged after the provider switch.
-        rows = q("SELECT plan_id, name, cost FROM legitdataway_plans "
-                 "WHERE service='data' AND network=? ORDER BY cost", (net,))
+        # Plans switched off in the admin panel are hidden from the shop.
+        if LW_HIDDEN_READY:
+            rows = q("SELECT plan_id, name, cost FROM legitdataway_plans "
+                     "WHERE service='data' AND network=? AND (hidden IS NULL OR hidden=0) ORDER BY cost", (net,))
+        else:
+            rows = q("SELECT plan_id, name, cost FROM legitdataway_plans "
+                     "WHERE service='data' AND network=? ORDER BY cost", (net,))
         plans = [{'variation_code': r['plan_id'], 'name': r['name'],
                   'cost': float(r['cost'] or 0),
                   'price': lw_sell_price(r['plan_id'], float(r['cost'] or 0))} for r in rows]
@@ -3512,6 +3532,25 @@ def legitdataway_plan_delete():
     r = row[0]
     log_admin('plan_delete', f"LegitDataWay {r['service']}/{r['network']} {r['name']} (plan_id {plan_id}) removed from shop")
     return jsonify({'ok': True})
+
+@app.post('/api/admin/legitdataway-plan-visibility')
+@admin_session_auth
+def legitdataway_plan_visibility():
+    d = request.get_json(force=True, silent=True) or {}
+    plan_id = (d.get('plan_id') or '').strip()
+    if not plan_id:
+        return jsonify({'ok': False, 'error': 'plan_id is required.'}), 400
+    hidden = 1 if d.get('hidden') else 0
+    row = q("SELECT service, network, name FROM legitdataway_plans WHERE plan_id=?", (plan_id,))
+    if not row:
+        return jsonify({'ok': False, 'error': 'Plan not found.'}), 404
+    try:
+        run("UPDATE legitdataway_plans SET hidden=? WHERE plan_id=?", (hidden, plan_id))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Plan switches are not ready yet. Try again in a moment.'}), 503
+    r = row[0]
+    log_admin('plan_toggle', f"LegitDataWay {r['service']}/{r['network']} {r['name']} (plan_id {plan_id}): {'hidden' if hidden else 'shown'}")
+    return jsonify({'ok': True, 'hidden': hidden})
 
 @app.get('/api/admin/legitdataway-discos')
 @admin_session_auth
