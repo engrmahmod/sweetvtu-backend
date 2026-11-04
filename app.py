@@ -3498,6 +3498,21 @@ def legitdataway_plan_save():
     log_admin('price_save', f'LegitDataWay {service}/{network} {name}: cost {cost}, sell {sell}')
     return jsonify({'ok': True})
 
+@app.delete('/api/admin/legitdataway-plan')
+@admin_session_auth
+def legitdataway_plan_delete():
+    d = request.get_json(force=True, silent=True) or {}
+    plan_id = (d.get('plan_id') or '').strip()
+    if not plan_id:
+        return jsonify({'ok': False, 'error': 'plan_id is required.'}), 400
+    row = q("SELECT service, network, name FROM legitdataway_plans WHERE plan_id=?", (plan_id,))
+    if not row:
+        return jsonify({'ok': False, 'error': 'Plan not found.'}), 404
+    run("DELETE FROM legitdataway_plans WHERE plan_id=?", (plan_id,))
+    r = row[0]
+    log_admin('plan_delete', f"LegitDataWay {r['service']}/{r['network']} {r['name']} (plan_id {plan_id}) removed from shop")
+    return jsonify({'ok': True})
+
 @app.get('/api/admin/legitdataway-discos')
 @admin_session_auth
 def legitdataway_discos_admin():
