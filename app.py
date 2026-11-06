@@ -61,6 +61,7 @@ SETTINGS_META = {
     'MANUAL_BANK':         dict(group='Manual funding', label='Bank', secret=False),
     'MANUAL_ACCOUNT_NUMBER': dict(group='Manual funding', label='Account number', secret=False),
     'MANUAL_ACCOUNT_NAME': dict(group='Manual funding', label='Account name', secret=False),
+    'WHATSAPP_NUMBER':    dict(group='Contact', label='WhatsApp number', secret=False),
 }
 SETTINGS_ALLOW = set(SETTINGS_META)
 
@@ -530,7 +531,8 @@ def init_db():
     # these in Connections. Seed only when missing, never overwrite edits.
     for _k, _v in (('MANUAL_BANK', 'Moniepoint'),
                    ('MANUAL_ACCOUNT_NUMBER', '9066336666'),
-                   ('MANUAL_ACCOUNT_NAME', 'Uxbridge Supply & Construction')):
+                   ('MANUAL_ACCOUNT_NAME', 'Uxbridge Supply & Construction'),
+                   ('WHATSAPP_NUMBER', '09037461659')):
         if not q("SELECT v FROM settings WHERE k=?", (_k,)):
             run("INSERT INTO settings(k,v) VALUES(?,?)", (_k, _v))
 
@@ -1278,6 +1280,7 @@ def config():
                     'provider': provider(), 'fatizara_ready': fatizara_configured(),
                     'bilal_ready': bilal_configured(),
                     'legitdataway_ready': legitdataway_configured(),
+                    'whatsapp_number': S('WHATSAPP_NUMBER'),
                     'email_via': 'brevo' if S('BREVO_API_KEY') else 'smtp',
                     'email_ready': bool(S('BREVO_API_KEY') or (SMTP_USER and SMTP_APP_PASSWORD)),
                     'monnify_ready': monnify_configured(),
