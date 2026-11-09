@@ -62,6 +62,7 @@ SETTINGS_META = {
     'MANUAL_ACCOUNT_NUMBER': dict(group='Manual funding', label='Account number', secret=False),
     'MANUAL_ACCOUNT_NAME': dict(group='Manual funding', label='Account name', secret=False),
     'WHATSAPP_NUMBER':    dict(group='Contact', label='WhatsApp number', secret=False),
+    'WALLET_PIN_HASH':     dict(group='Security', label='Wallet PIN (hashed)', secret=True),
 }
 SETTINGS_ALLOW = set(SETTINGS_META)
 
@@ -3808,14 +3809,24 @@ def admin_wallet():
     except: amount = 0
     action = d.get('action', 'add')
     note = (d.get('note') or '').strip()[:200]
-    rows = q("SELECT id FROM users WHERE phone=?", (phone,))
+    rows = q("SELECT id, wallet FROM users WHERE phone=?", (phone,))
     if not rows: return jsonify({'ok': False, 'error': 'User not found.'}), 404
+    if action == 'remove' and amount > float(rows[0]['wallet'] or 0):
+        return jsonify({'ok': False, 'error': 'Amount is more than the customer\'s balance.'}), 400
+    stored_pin = S('WALLET_PIN_HASH')
+    if stored_pin:
+        pin = str(d.get('pin') or '').strip()
+        try: pin_ok = check_password_hash(stored_pin, pin)
+        except Exception: pin_ok = False
+        if not pin_ok:
+            return jsonify({'ok': False, 'error': 'Wrong wallet PIN.'}), 403
     delta = amount if action == 'add' else -amount
     run("UPDATE users SET wallet=wallet+? WHERE phone=?", (delta, phone))
     desc = f'Admin wallet adjustment ({action})' + (f' — {note}' if note else '')
+    direction = 'out' if action == 'remove' else 'in'
     run("""INSERT INTO transactions(user_id,type,service,description,amount,direction,
-           status,reference,created) VALUES(?, 'fund','admin',?,?, 'in','successful',?,?)""",
-        (rows[0]['id'], desc, amount,
+           status,reference,created) VALUES(?, 'fund','admin',?,?, ?,'successful',?,?)""",
+        (rows[0]['id'], desc, amount, direction,
          'SVA' + secrets.token_hex(5).upper(), now_iso()))
     log_admin('wallet_adjust', f'{action} {amount} for {phone}' + (f' — {note}' if note else ''))
     return jsonify({'ok': True})
@@ -3899,9 +3910,14 @@ def cost_check():
 def admin_settings():
     # Staff sessions never see secret values: they come back blank.
     staff = getattr(g, 'is_staff', False)
-    items = [{'key': k, 'group': m['group'], 'label': m['label'],
+    items = []
+    for k, m in SETTINGS_META.items():
+        it = {'key': k, 'group': m['group'], 'label': m['label'],
               'secret': m['secret'], 'value': ('' if (staff and m['secret']) else S(k))}
-             for k, m in SETTINGS_META.items()]
+        if k == 'WALLET_PIN_HASH':
+            # Presence only — staff must know a PIN is required, never the hash.
+            it['pin_set'] = bool(S(k))
+        items.append(it)
     return jsonify({'ok': True, 'settings': items})
 
 @app.post('/api/admin/settings')
@@ -3915,6 +3931,8 @@ def admin_settings_save():
     value = d.get('value')
     if key not in SETTINGS_ALLOW:
         return jsonify({'ok': False, 'error': 'That setting cannot be changed here.'}), 400
+    if key == 'WALLET_PIN_HASH':
+        return jsonify({'ok': False, 'error': 'Set the wallet PIN from the Security page.'}), 400
     value = '' if value is None else str(value)
     if key.endswith('_SANDBOX') and value not in ('0', '1'):
         return jsonify({'ok': False, 'error': 'Sandbox must be 0 or 1.'}), 400
@@ -3930,6 +3948,33 @@ def admin_settings_save():
         _monnify['token'] = None
         _monnify['exp'] = 0
     return jsonify({'ok': True})
+
+@app.post('/api/admin/wallet-pin')
+@admin_session_auth
+def admin_wallet_pin():
+    # Only the main admin sets the wallet PIN. The PIN itself is never
+    # stored — only its hash. Empty PIN removes the PIN entirely.
+    blocked = _main_admin_only()
+    if blocked:
+        return blocked
+    d = request.get_json(force=True, silent=True) or {}
+    pin = str(d.get('pin') or '').strip()
+    if pin == '':
+        run("""INSERT INTO settings(k,v,updated_at) VALUES(?,?,?)
+               ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at""",
+            ('WALLET_PIN_HASH', '', now_iso()))
+        SETTINGS['WALLET_PIN_HASH'] = ''
+        log_admin('wallet_pin_removed', '')
+        return jsonify({'ok': True, 'set': False})
+    if not re.fullmatch(r'\d{4}', pin):
+        return jsonify({'ok': False, 'error': 'PIN must be exactly 4 digits.'}), 400
+    h = generate_password_hash(pin)
+    run("""INSERT INTO settings(k,v,updated_at) VALUES(?,?,?)
+           ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at""",
+        ('WALLET_PIN_HASH', h, now_iso()))
+    SETTINGS['WALLET_PIN_HASH'] = h
+    log_admin('wallet_pin_set', '')
+    return jsonify({'ok': True, 'set': True})
 
 @app.post('/api/admin/test-connection')
 @admin_session_auth
