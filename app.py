@@ -52,6 +52,7 @@ SETTINGS_META = {
     'LEGITDATAWAY_USERNAME': dict(group='LegitDataWay', label='LegitDataWay username', secret=True),
     'LEGITDATAWAY_PASSWORD': dict(group='LegitDataWay', label='LegitDataWay password', secret=True),
     'XPOUCH_API_KEY':     dict(group='Xpouch',   label='API Key',      secret=True),
+    'XPOUCH_API_KEY_OLD': dict(group='Xpouch',   label='Previous merchant API Key — keeps old virtual accounts crediting', secret=True),
     'XPOUCH_SECRET':      dict(group='Xpouch',   label='API Secret',   secret=True),
     'XPOUCH_SANDBOX':     dict(group='Xpouch',   label='Sandbox mode — 1 = test, 0 = LIVE', secret=True),
     'BREVO_API_KEY':      dict(group='Email',    label='Brevo API Key', secret=True),
@@ -558,6 +559,7 @@ def load_settings():
         'BILAL_USERNAME': os.environ.get('BILAL_USERNAME', ''),
         'BILAL_PASSWORD': os.environ.get('BILAL_PASSWORD', ''),
         'XPOUCH_API_KEY': os.environ.get('XPOUCH_API_KEY', '').strip(),
+        'XPOUCH_API_KEY_OLD': os.environ.get('XPOUCH_API_KEY_OLD', '').strip(),
         'XPOUCH_SECRET': os.environ.get('XPOUCH_SECRET', '').strip(),
         'XPOUCH_SANDBOX': os.environ.get('XPOUCH_SANDBOX', '1'),
         'FUNDING_PROVIDER': os.environ.get('FUNDING_PROVIDER', 'monnify'),
@@ -2128,16 +2130,23 @@ def _xpouch_sig_ok(sig, data):
     """Verify an Xpouch webhook signature: HMAC-SHA256 hex of the data
     object, keyed with the merchant API KEY. Several canonical writings
     are accepted (see _xpouch_canon_variants) because the sender's exact
-    sorting depth is undocumented; all of them still require the key."""
+    sorting depth is undocumented; all of them still require the key.
+    Tries the current key first, then the previous merchant's key
+    (XPOUCH_API_KEY_OLD), so virtual accounts issued under the old
+    merchant keep crediting after a merchant swap."""
     sig = (sig or '').strip().lower()
-    key = (S('XPOUCH_API_KEY') or '').strip()
-    if not sig or not key or data is None:
+    if not sig or data is None:
         return False
-    for canon in _xpouch_canon_variants(data):
-        h = hmac.new(key.encode('utf-8'), canon.encode('utf-8'),
-                     hashlib.sha256).hexdigest().lower()
-        if hmac.compare_digest(h, sig):
-            return True
+    keys = [k for k in ((S('XPOUCH_API_KEY') or '').strip(),
+                        (S('XPOUCH_API_KEY_OLD') or '').strip()) if k]
+    if not keys:
+        return False
+    for key in keys:
+        for canon in _xpouch_canon_variants(data):
+            h = hmac.new(key.encode('utf-8'), canon.encode('utf-8'),
+                         hashlib.sha256).hexdigest().lower()
+            if hmac.compare_digest(h, sig):
+                return True
     return False
 
 def _xpouch_credit_amount(d):
