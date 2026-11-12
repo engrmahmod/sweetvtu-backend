@@ -3985,6 +3985,73 @@ def admin_wallet_pin():
     log_admin('wallet_pin_set', '')
     return jsonify({'ok': True, 'set': True})
 
+@app.post('/api/admin/xpouch-reissue')
+@admin_session_auth
+def admin_xpouch_reissue():
+    """Re-issue Xpouch virtual accounts under the CURRENT merchant, in id
+    order, a batch at a time. Used when the funding merchant changes: every
+    user who already has a permanent account gets a fresh one from the new
+    merchant, so future fundings land in the new merchant's Xpouch account.
+    Safe by design: a user's row is only updated AFTER the new account is
+    successfully created; on any failure the old account stays untouched,
+    so the user can still fund on the old number (the old merchant's
+    webhooks are still accepted). Pass after_id = last id processed and
+    limit = batch size; the response reports last_id and how many remain."""
+    blocked = _main_admin_only()
+    if blocked:
+        return blocked
+    d = request.get_json(force=True, silent=True) or {}
+    try:
+        after_id = int(d.get('after_id') or 0)
+    except Exception:
+        after_id = 0
+    try:
+        limit = int(d.get('limit') or 25)
+    except Exception:
+        limit = 25
+    limit = max(1, min(limit, 50))
+    if not xpouch_configured():
+        return jsonify({'ok': False, 'error': 'Xpouch is not set up.'}), 503
+    rows = q("SELECT id,name,username,email,xpouch_ref,xpouch_acct FROM users "
+             "WHERE xpouch_acct IS NOT NULL AND xpouch_acct != '' AND id > ? "
+             "ORDER BY id ASC LIMIT ?", (after_id, limit))
+    migrated = []
+    failed = []
+    last_id = after_id
+    for row in rows:
+        last_id = row['id']
+        new_ref = 'panther-' + uuid.uuid4().hex[:20]
+        try:
+            r = requests.post(f'{xpouch_base()}/virtual-accounts/create',
+                              headers=xpouch_headers(),
+                              json={'customer_reference': new_ref,
+                                    'customer_name': (row.get('name') or 'Panther Data Customer')[:100]},
+                              timeout=30).json()
+        except Exception:
+            failed.append({'id': row['id'], 'username': row.get('username'),
+                           'error': 'Could not reach Xpouch.'})
+            continue
+        if not r.get('success'):
+            failed.append({'id': row['id'], 'username': row.get('username'),
+                           'error': str((r.get('errors') or r.get('message')) or 'Xpouch error')})
+            continue
+        acct, bank, name = _xpouch_account_fields(r.get('data') or {})
+        if not acct:
+            failed.append({'id': row['id'], 'username': row.get('username'),
+                           'error': 'No account number returned.'})
+            continue
+        run("""UPDATE users SET xpouch_ref=?, xpouch_acct=?, xpouch_bank=?,
+               xpouch_acct_name=? WHERE id=?""",
+            (new_ref, acct, bank, name or row.get('name'), row['id']))
+        migrated.append({'id': row['id'], 'username': row.get('username'),
+                         'account_number': acct})
+    rem = q("SELECT COUNT(*) AS c FROM users WHERE xpouch_acct IS NOT NULL "
+            "AND xpouch_acct != '' AND id > ?", (last_id,))
+    remaining = (rem[0]['c'] if rem else 0)
+    log_admin('xpouch_reissue', f'migrated {len(migrated)}, failed {len(failed)}, remaining {remaining}')
+    return jsonify({'ok': True, 'migrated': migrated, 'failed': failed,
+                    'last_id': last_id, 'remaining': remaining})
+
 @app.post('/api/admin/test-connection')
 @admin_session_auth
 def admin_test_connection():
