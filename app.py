@@ -1292,14 +1292,12 @@ def config():
 
 @app.get('/api/ping')
 def ping():
-    """Keep-warm probe: touches the database with SELECT 1 and nothing else.
-    A scheduled ping every few minutes keeps both Render and the Neon
-    database awake, so shop loads stay fast. No customer data, no auth."""
-    try:
-        q("SELECT 1")
-        return jsonify({'ok': True})
-    except Exception:
-        return jsonify({'ok': False}), 500
+    """Keep-warm probe: returns ok WITHOUT touching the database.
+    A scheduled ping every few minutes keeps the Render server awake.
+    The Neon database is NOT touched here, so it auto-suspends when idle
+    and wakes on real use — this keeps Neon compute usage low.
+    No customer data, no auth."""
+    return jsonify({'ok': True})
 
 @app.post('/api/signup')
 @limiter.limit('5 per minute')
